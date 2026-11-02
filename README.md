@@ -56,7 +56,7 @@ reel play tt0017136 --output tct
 
 In the TUI, video plays inside reel's Now Playing screen, `t` switches to theater mode and `f` or `F11` to fullscreen (`esc` leaves). This uses mpv's `--wid` with a child of the terminal window, so it needs Windows Terminal or the classic Windows console. Elsewhere, or with `output = "window"` in the config, mpv opens its own window. `P` on a stream picks for one play.
 
-The mouse works everywhere: click tabs, buttons and rows (a second click opens what is selected), scroll lists, and right-click to go back. Now Playing has a control bar with a seek bar and volume you can click or drag. On the video itself, mpv's own controls appear when you hover: click to pause, double-click for fullscreen. Hold `Shift` while dragging to select text in the terminal.
+The mouse works everywhere: click tabs, buttons and rows (a second click opens what is selected), scroll lists, and right-click to go back. Now Playing has a control bar with a seek bar and volume you can click or drag. On the video itself, click to pause and double-click for fullscreen. In fullscreen, use the keyboard to seek. Hold `Shift` while dragging to select text in the terminal.
 
 `--output` takes `window`, `fullscreen` or an mpv terminal video output such as `tct`, `kitty` or `sixel`.
 

@@ -39,10 +39,13 @@ mod imp {
                 let screen = info.rcMonitor;
                 SetParent(hwnd, std::ptr::null_mut());
                 SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_CLIPCHILDREN) as isize);
+                // Clicks may activate it now, which is how it comes back after using another app.
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, WS_EX_TOOLWINDOW as isize);
                 SetWindowPos(hwnd, HWND_TOPMOST, screen.left, screen.top, screen.right - screen.left, screen.bottom - screen.top, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
             } else {
                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW);
                 SetWindowLongPtrW(hwnd, GWL_STYLE, CHILD_STYLE as isize);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize);
                 SetParent(hwnd, terminal);
                 SetWindowPos(hwnd, HWND_TOP, 0, 0, 1, 1, SWP_NOACTIVATE | SWP_FRAMECHANGED);
             }
@@ -136,11 +139,13 @@ mod imp {
                     if !video.is_null() && IsWindowEnabled(video) == 0 {
                         EnableWindow(video, 1);
                     }
-                    // A fullscreen video stays on top only while reel is in use, so
-                    // switching to another app works.
-                    if FULLSCREEN.load(Ordering::Relaxed) {
-                        let active = GetForegroundWindow();
-                        let ours = active == terminal as HWND || active == hwnd || IsChild(hwnd, active) != 0;
+                    // A fullscreen video stays on top only while reel is in use. When another
+                    // app is clicked it stays fullscreen just behind that app, so it remains
+                    // visible if that app is on another monitor.
+                    let active = GetForegroundWindow();
+                    if FULLSCREEN.load(Ordering::Relaxed) && !active.is_null() {
+                        let on_video = active == hwnd || IsChild(hwnd, active) != 0;
+                        let ours = on_video || active == terminal as HWND;
                         if ours != on_top {
                             on_top = ours;
                             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
@@ -148,10 +153,18 @@ mod imp {
                                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
                             } else {
                                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
-                                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
+                                // Going behind an always-on-top window would make this one
+                                // always-on-top too, and newly opened apps would sit under it.
+                                if GetWindowLongPtrW(active, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST == 0 {
+                                    SetWindowPos(hwnd, active, 0, 0, 0, 0, flags);
+                                }
                             }
                         }
-                    } else {
+                        // Clicking the video brings it back; the keyboard belongs to reel.
+                        if on_video && GetAsyncKeyState(VK_LBUTTON as i32) >= 0 && GetAsyncKeyState(VK_RBUTTON as i32) >= 0 {
+                            SetForegroundWindow(terminal as HWND);
+                        }
+                    } else if !FULLSCREEN.load(Ordering::Relaxed) {
                         on_top = true;
                     }
                     // A click on the video gives mpv the keyboard. Once the button is up

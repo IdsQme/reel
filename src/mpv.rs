@@ -118,7 +118,8 @@ impl PlayRequest {
         if let Some(wid) = self.wid {
             args.push(format!("--wid={wid}"));
             args.push("--no-window-dragging".to_string());
-            args.push("--script-opts=osc-windowcontrols=no".to_string());
+            // reel draws the controls.
+            args.push("--no-osc".to_string());
         }
         if self.fullscreen {
             args.push("--fullscreen".to_string());
@@ -448,6 +449,14 @@ mod tests {
         let profile = args.iter().position(|a| a == "--profile=high-quality").unwrap();
         assert!(profile < args.iter().position(|a| a == "--scale=bilinear").unwrap());
         assert!(!PlayRequest::default().args("sock").contains(&"--profile=high-quality".to_string()));
+    }
+
+    #[test]
+    fn embedded_video_has_no_mpv_controls() {
+        let embedded = PlayRequest { target: "x".into(), wid: Some(1), ..Default::default() };
+        assert!(embedded.args("sock").contains(&"--no-osc".to_string()));
+        let windowed = PlayRequest { target: "x".into(), ..Default::default() };
+        assert!(!windowed.args("sock").contains(&"--no-osc".to_string()));
     }
 
     #[test]
