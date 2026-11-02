@@ -333,7 +333,7 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
             (keys, ("esc", "back"))
         }
         Screen::Playing => (
-            vec![("space", "pause"), ("←/→", "5 s"), ("⇧←/→", "60 s"), ("↑/↓", "volume"), ("[ ]", "speed"), ("s", "subs"), ("a", "audio"), ("c", "chapter"), ("n", "next")],
+            vec![("space", "pause"), ("←/→", "5 s"), ("⇧←/→", "60 s"), ("↑/↓", "volume"), ("[ ]", "speed"), ("s", "subs"), ("a", "audio"), ("c", "chapter"), ("n", "next"), ("f", "fullscreen")],
             ("q", "stop"),
         ),
     };
@@ -639,7 +639,7 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     let [poster, play_btn, buttons] = Layout::vertical([Constraint::Length(poster_h.min(aside.height.saturating_sub(actions_h))), Constraint::Length(3), Constraint::Length(3)]).areas(aside);
     draw_poster(f, app, poster, meta, false);
 
-    let best = app.current_streams().and_then(|set| streams::best_index(&set.rows, &app.config.streams.prefer).map(|i| set.rows[i].quality.clone()));
+    let best = app.current_streams().and_then(|set| streams::best_index(&set.rows, &app.config.streams).map(|i| set.rows[i].quality.clone()));
     let play_label = match &best {
         Some(q) => format!("▶ Play best · {q}"),
         None if app.current_streams().is_some_and(|s| s.pending > 0) => "… finding streams".to_string(),
@@ -766,6 +766,7 @@ fn draw_streams(f: &mut Frame, app: &App, area: Rect, d: &Details) {
     if rows.is_empty() {
         let message = match set {
             Some(set) if set.pending > 0 => "Asking addons for streams…".to_string(),
+            Some(set) if !set.errors.is_empty() => format!("{} did not answer. Press esc and open this title again to retry.", set.errors.join(", ")),
             Some(_) => "No streams found. Try installing another stream addon (4).".to_string(),
             None if d.meta.is_series() => "Pick an episode.".to_string(),
             None => String::new(),
@@ -1011,13 +1012,9 @@ fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
     let st = &p.state;
     let char_key = |c: char| Some(KeyCode::Char(c));
     let play = if st.paused { " ▶ Play " } else { " ‖ Pause " };
-    let view = match (p.embedded, p.theater) {
-        (true, true) => " ▣ Panels ".to_string(),
-        (true, false) => " ▣ Theater ".to_string(),
-        _ => " ▣ Fullscreen ".to_string(),
-    };
+    let view = if p.theater { " ▣ Panels " } else { " ▣ Theater " };
     let loop_label = if st.looping { " ⟳ Loop on " } else { " ⟳ Loop " };
-    let left: Vec<(String, Option<KeyCode>, Style)> = vec![
+    let mut left: Vec<(String, Option<KeyCode>, Style)> = vec![
         (" |◀ ".to_string(), char_key('C'), fg(TEXT).bg(SURFACE0)),
         (" ◀◀ ".to_string(), Some(KeyCode::Left), fg(TEXT).bg(SURFACE0)),
         (play.to_string(), char_key(' '), bold(CRUST).bg(accent)),
@@ -1030,9 +1027,13 @@ fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
         (" Subs ".to_string(), char_key('s'), fg(TEXT).bg(SURFACE0)),
         (" Audio ".to_string(), char_key('a'), fg(TEXT).bg(SURFACE0)),
         (loop_label.to_string(), char_key('l'), fg(TEXT).bg(SURFACE0)),
-        (view, char_key('f'), fg(TEXT).bg(SURFACE0)),
+        (view.to_string(), char_key('t'), fg(TEXT).bg(SURFACE0)),
+        (" ▢ Fullscreen ".to_string(), char_key('f'), fg(TEXT).bg(SURFACE0)),
         (" ■ Stop ".to_string(), char_key('q'), fg(RED).bg(SURFACE0)),
     ];
+    if !p.embedded {
+        left.retain(|(_, code, _)| *code != char_key('t'));
+    }
     let volume_w = 20u16;
     let mut x = area.x;
     let limit = area.right().saturating_sub(volume_w + 12);
@@ -1058,9 +1059,9 @@ fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
 /// The panel mpv's video window sits on.
 fn draw_video(f: &mut Frame, app: &App, area: Rect) {
     let Some(p) = &app.playing else { return };
-    let right = if p.theater { "f panels" } else { "f theater" };
+    let right = if p.theater { "t panels · f fullscreen" } else { "t theater · f fullscreen" };
     let inner = panel(f, area, "Video", right, false, app.accent());
-    hit(app, Rect::new(area.right().saturating_sub(right.width() as u16 + 3), area.y, right.width() as u16 + 2, 1), Hit::Key(KeyCode::Char('f')));
+    hit(app, Rect::new(area.right().saturating_sub(right.width() as u16 + 3), area.y, right.width() as u16 + 2, 1), Hit::Key(KeyCode::Char('t')));
     fill(f.buffer_mut(), inner, CRUST);
     app.video_cells.set(Some(inner));
 }
@@ -1392,7 +1393,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
         Some(set) if set.pending == 0 => Line::from(vec![label("Streams"), s(format!("{} from {} addons", set.rows.len(), set.addons_with_results()), TEXT)]),
         _ => Line::from(vec![label("Streams"), s("looking…", OVERLAY2)]),
     };
-    let best = app.stream_cache.get(&meta.id).and_then(|set| streams::best_index(&set.rows, &app.config.streams.prefer).map(|i| &set.rows[i]));
+    let best = app.stream_cache.get(&meta.id).and_then(|set| streams::best_index(&set.rows, &app.config.streams).map(|i| &set.rows[i]));
     let best_line = match best {
         Some(row) => Line::from(vec![label("Best"), b(row.quality.clone(), quality_color(&row.quality)), s(format!(" · {}", row.addon), TEXT)]),
         None => Line::from(vec![label("Best"), s("—", OVERLAY2)]),
@@ -1573,6 +1574,8 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         on_off(c.streams.autoplay_next),
         format!("{} s", c.streams.timeout),
         on_off(c.subtitles.auto),
+        if c.player.high_quality { "high".to_string() } else { "standard".to_string() },
+        format!("{} GB", c.streams.max_size_gb),
     ];
     for (i, (label, value)) in SETTINGS.iter().zip(values).enumerate() {
         let y = inner.y + i as u16;
@@ -1608,7 +1611,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered(area, 80, 23);
+    let popup = centered(area, 80, 24);
     f.render_widget(Clear, popup);
     let inner = pad(panel(f, popup, "Keys", "any key closes", true, app.accent()), 1);
     let entry = |key: &str, what: &str| Line::from(vec![b(format!("{key:<12}"), PEACH), s(what.to_string(), SUBTEXT1)]);
@@ -1630,7 +1633,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         entry("[ ] \\", "slower, faster, reset speed"),
         entry("s a c n", "next subtitle, audio, chapter, title"),
         entry("z x  Z X", "subtitle delay, subtitle size"),
-        entry("l f A", "loop, theater or fullscreen, autoplay next"),
+        entry("l A", "loop, autoplay next"),
+        entry("f F11  t", "fullscreen (esc leaves), theater"),
         entry("q  esc", "stop playback, keep playing in background"),
         entry("mouse", "click buttons and rows; click again to open; right-click goes back"),
     ];
@@ -1745,7 +1749,7 @@ mod tests {
         let stream = Stream { info_hash: Some("abc".into()), name: "Torrentio\n1080p".into(), title: "Nosferatu.1922.1080p.BluRay.x264.mkv\n👤 42 💾 2.1 GB ⚙️ YTS".into(), ..Default::default() };
         let other = Stream { info_hash: Some("def".into()), name: "Torrentio\n720p".into(), title: "Nosferatu.1922.720p.WEB.x265.mp4\n👤 0 💾 980 MB ⚙️ TPB".into(), ..Default::default() };
         let rows = vec![to_row(stream, "Torrentio", 1), to_row(other, "Torrentio", 1)];
-        app.stream_cache.insert(meta.id.clone(), StreamSet { rows, pending: 0, total: 1, ms: 98 });
+        app.stream_cache.insert(meta.id.clone(), StreamSet { rows, pending: 0, total: 1, ms: 98, errors: Vec::new() });
         app.sub_cache.insert(meta.id.clone(), vec![Subtitle { url: "u".into(), lang: "eng".into(), addon: "OpenSubtitles v3".into() }, Subtitle { url: "v".into(), lang: "ger".into(), addon: "OpenSubtitles v3".into() }]);
         app.details = Some(Details {
             meta,
@@ -1847,6 +1851,7 @@ mod tests {
             fullscreen: false,
             embedded: false,
             theater: false,
+            video_fullscreen: false,
             mpv_fullscreen: None,
         });
         let frame = render(&app, 152, 38);
@@ -1880,6 +1885,7 @@ mod tests {
             fullscreen: false,
             embedded: true,
             theater: false,
+            video_fullscreen: false,
             mpv_fullscreen: None,
         });
         for (w, h) in [(80, 24), (100, 30), (152, 38), (237, 62)] {
@@ -1889,11 +1895,11 @@ mod tests {
             assert!(cells.right() <= w && cells.bottom() <= h);
         }
         let frame = render(&app, 152, 38);
-        for expected in ["Tracks", "Playback", "Up next", "mpv · IPC", "in reel", "f theater"] {
+        for expected in ["Tracks", "Playback", "Up next", "mpv · IPC", "in reel", "t theater", "Fullscreen"] {
             assert!(frame.contains(expected), "missing {expected:?} in\n{frame}");
         }
         let normal = app.video_cells.get().unwrap();
-        for expected in ["Pause", "Theater", "Stop", "Vol", "Next", "Subs"] {
+        for expected in ["Pause", "Theater", "Fullscreen", "Stop", "Vol", "Next", "Subs"] {
             assert!(frame.contains(expected), "missing {expected:?} in\n{frame}");
         }
         assert!(app.hits.borrow().iter().any(|(_, h)| *h == Hit::Seek));
@@ -1982,6 +1988,15 @@ mod tests {
         click(&mut app, x, y);
         assert_eq!(app.overlay, Overlay::None);
         assert_eq!(app.screen, Screen::Discover);
+    }
+
+    #[tokio::test]
+    async fn failed_addons_are_reported_instead_of_no_streams() {
+        let mut app = details_app();
+        app.stream_cache.insert("tt0013442".into(), StreamSet { total: 1, errors: vec!["Torrentio".into()], ..Default::default() });
+        let frame = render(&app, 152, 38);
+        assert!(frame.contains("Torrentio did not answer"), "{frame}");
+        assert!(!frame.contains("No streams found"), "{frame}");
     }
 
     #[tokio::test]

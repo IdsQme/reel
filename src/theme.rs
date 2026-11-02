@@ -52,6 +52,7 @@ pub fn quality_color(quality: &str) -> Color {
     match quality {
         "2160p" | "1440p" | "1080p" => GREEN,
         "720p" => SKY,
+        "CAM" => RED,
         _ => SUBTEXT1,
     }
 }

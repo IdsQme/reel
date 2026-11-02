@@ -27,7 +27,7 @@ pub enum Ev {
     AddonReady(String, Box<Addon>),
     Catalog { generation: u64, items: Vec<Meta>, append: bool, ms: u128, error: Option<String> },
     Meta(String, Box<Meta>),
-    Streams { video_id: String, rows: Vec<StreamRow>, ms: u128 },
+    Streams { video_id: String, rows: Vec<StreamRow>, ms: u128, error: Option<String> },
     Subs(String, Vec<Subtitle>),
     PreviewDue(u64),
     SearchDue(u64),
@@ -163,6 +163,8 @@ pub struct StreamSet {
     pub pending: usize,
     pub total: usize,
     pub ms: u128,
+    /// Addons that failed to answer. Such a set is fetched again next time it is opened.
+    pub errors: Vec<String>,
 }
 
 impl StreamSet {
@@ -211,7 +213,9 @@ pub struct Playing {
     pub embedded: bool,
     /// Embedded video fills the screen, with only the transport row below it.
     pub theater: bool,
-    /// Last value of mpv's fullscreen property: its fullscreen controls toggle theater mode.
+    /// Embedded video covers the whole monitor.
+    pub video_fullscreen: bool,
+    /// Last value of mpv's fullscreen property: its own controls toggle `video_fullscreen`.
     pub mpv_fullscreen: Option<bool>,
 }
 
@@ -222,8 +226,8 @@ pub struct AddonsView {
     pub confirm_remove: bool,
 }
 
-pub const SETTINGS: [&str; 10] =
-    ["Accent", "Posters", "Output", "Resume", "Volume", "Prefer quality", "Autoplay", "Autoplay next", "Addon timeout", "Subtitles auto"];
+pub const SETTINGS: [&str; 12] =
+    ["Accent", "Posters", "Output", "Resume", "Volume", "Prefer quality", "Autoplay", "Autoplay next", "Addon timeout", "Subtitles auto", "Video quality", "Best max size"];
 
 pub struct App {
     pub config: Config,
@@ -378,6 +382,7 @@ impl App {
 
     /// Refreshes every manifest in the background and loads the first catalog.
     pub fn start(&mut self) {
+        tokio::task::spawn_blocking(crate::torrent::sweep_stale);
         for addon in &self.addons {
             let (client, tx, entry) = (self.client.clone(), self.tx.clone(), AddonEntry { url: addon.url.clone(), enabled: addon.enabled });
             tokio::spawn(async move {
@@ -392,6 +397,8 @@ impl App {
         self.posters.process(&self.posters_http, &self.tx);
         if let Some(host) = &self.video_host {
             let (cols, rows) = self.frame_size.get();
+            let fullscreen = self.screen == Screen::Playing && self.overlay == Overlay::None && self.playing.as_ref().is_some_and(|p| p.video_fullscreen);
+            host.set_fullscreen(fullscreen);
             host.place(self.video_cells.get(), cols, rows);
         }
     }
@@ -402,6 +409,9 @@ impl App {
         if let Some(control) = self.playing.as_ref().and_then(|p| p.control.as_ref()) {
             control.command(json!(["quit"]));
             tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        if let (Some(hash), Some(engine)) = (self.playing.as_ref().and_then(|p| p.hash.clone()), self.engine.get()) {
+            let _ = tokio::time::timeout(Duration::from_secs(2), engine.close(&hash)).await;
         }
     }
 
@@ -553,7 +563,7 @@ impl App {
     }
 
     fn fetch_streams(&mut self, kind: &str, video_id: &str) {
-        if self.stream_cache.contains_key(video_id) {
+        if self.stream_cache.get(video_id).is_some_and(|set| set.pending > 0 || set.errors.is_empty()) {
             return;
         }
         let targets: Vec<(usize, Addon)> = self.addons.iter().cloned().enumerate().filter(|(_, a)| a.enabled && a.manifest.supports("stream", kind, video_id)).collect();
@@ -565,9 +575,12 @@ impl App {
             let (client, tx, kind, video_id) = (self.client.clone(), self.tx.clone(), kind.to_string(), video_id.to_string());
             tokio::spawn(async move {
                 let started = Instant::now();
-                let found = client.streams(&addon, &kind, &video_id).await.unwrap_or_default();
+                let (found, error) = match client.streams(&addon, &kind, &video_id).await {
+                    Ok(found) => (found, None),
+                    Err(_) => (Vec::new(), Some(addon.manifest.name.clone())),
+                };
                 let rows = found.into_iter().map(|s| streams::to_row(s, &addon.manifest.name, order)).collect();
-                let _ = tx.send(Ev::Streams { video_id, rows, ms: started.elapsed().as_millis() });
+                let _ = tx.send(Ev::Streams { video_id, rows, ms: started.elapsed().as_millis(), error });
             });
         }
     }
@@ -658,7 +671,7 @@ impl App {
     }
 
     fn sync_stream_cursor(&mut self) {
-        let prefer = self.config.streams.prefer.clone();
+        let prefer = self.config.streams.clone();
         let best = self.current_streams().and_then(|s| streams::best_index(&s.rows, &prefer));
         if let Some(d) = &mut self.details
             && !d.cursor_touched
@@ -712,7 +725,7 @@ impl App {
         }
         let (meta, video_id) = self.pending_play.take().unwrap();
         let rows = self.stream_cache.get(&video_id).map(|s| s.rows.clone()).unwrap_or_default();
-        match streams::best_index(&rows, &self.config.streams.prefer) {
+        match streams::best_index(&rows, &self.config.streams) {
             Some(i) => self.start_play(meta, video_id, rows[i].clone(), None, PlayMode::Configured),
             None => {
                 self.toast(false, format!("no streams found for {}", meta.name));
@@ -818,6 +831,7 @@ impl App {
             fullscreen,
             embedded: wid.is_some(),
             theater: false,
+            video_fullscreen: false,
             mpv_fullscreen: None,
         });
         self.screen = Screen::Playing;
@@ -831,6 +845,7 @@ impl App {
             fullscreen,
             audio_only: mode == PlayMode::AudioOnly,
             wid,
+            high_quality: self.config.player.high_quality,
             terminal_vo: None,
             extra_args: self.config.player.args.clone(),
             subs: picked,
@@ -987,8 +1002,9 @@ impl App {
                 }
                 self.sync_series_position();
             }
-            Ev::Streams { video_id, rows, ms } => {
+            Ev::Streams { video_id, rows, ms, error } => {
                 if let Some(set) = self.stream_cache.get_mut(&video_id) {
+                    set.errors.extend(error);
                     set.rows.extend(rows);
                     set.pending = set.pending.saturating_sub(1);
                     set.ms = set.ms.max(ms);
@@ -1095,8 +1111,7 @@ impl App {
                 if name == "fullscreen" {
                     let now = value.as_bool().unwrap_or(false);
                     if p.embedded && p.mpv_fullscreen.is_some_and(|before| before != now) {
-                        p.theater = !p.theater;
-                        self.needs_clear = true;
+                        p.video_fullscreen = !p.video_fullscreen;
                     }
                     p.mpv_fullscreen = Some(now);
                     return;
@@ -1136,6 +1151,7 @@ impl App {
         if let Some(p) = &mut self.playing {
             if let (Some(hash), Some(engine)) = (&p.hash, engine) {
                 p.torrent = engine.status(hash);
+                engine.pace(hash, p.state.duration, p.state.cache_seconds, p.state.buffering);
             }
             save = p.last_saved.elapsed() > Duration::from_secs(10);
         }
@@ -1674,7 +1690,7 @@ impl App {
             KeyCode::Char('s') => self.cycle_subtitle(),
             KeyCode::Char('P') => self.overlay = Overlay::PlayWith(0),
             KeyCode::Char(c) if c == play_key => {
-                let best = self.current_streams().and_then(|s| streams::best_index(&s.rows, &self.config.streams.prefer));
+                let best = self.current_streams().and_then(|s| streams::best_index(&s.rows, &self.config.streams));
                 if let (Some(best), Some(d)) = (best, &mut self.details) {
                     d.stream_cursor = best;
                     self.play_selected_row(PlayMode::Configured);
@@ -1808,10 +1824,13 @@ impl App {
             KeyCode::Char('Z') => control.command(json!(["add", "sub-scale", -0.1])),
             KeyCode::Char('X') => control.command(json!(["add", "sub-scale", 0.1])),
             KeyCode::Char('l') => control.command(json!(["cycle-values", "loop-file", "inf", "no"])),
-            KeyCode::Char('f') if p.embedded => {
+            KeyCode::Char('f') | KeyCode::F(11) if p.embedded => p.video_fullscreen = !p.video_fullscreen,
+            KeyCode::Char('t') if p.embedded => {
                 p.theater = !p.theater;
                 self.needs_clear = true;
             }
+            KeyCode::F(11) => control.command(json!(["cycle", "fullscreen"])),
+            KeyCode::Esc if p.video_fullscreen => p.video_fullscreen = false,
             KeyCode::Char('f') => control.command(json!(["cycle", "fullscreen"])),
             KeyCode::Char('A') => {
                 self.config.streams.autoplay_next = !self.config.streams.autoplay_next;
@@ -2012,6 +2031,13 @@ impl App {
             7 => c.streams.autoplay_next = !c.streams.autoplay_next,
             8 => c.streams.timeout = (c.streams.timeout as i64 + delta(1)).clamp(2, 60) as u64,
             9 => c.subtitles.auto = !c.subtitles.auto,
+            10 => c.player.high_quality = !c.player.high_quality,
+            11 => {
+                const SIZES: [u64; 4] = [10, 25, 50, 100];
+                let at = SIZES.iter().position(|s| *s == c.streams.max_size_gb).unwrap_or(1);
+                let next = if forward { (at + 1) % SIZES.len() } else { (at + SIZES.len() - 1) % SIZES.len() };
+                c.streams.max_size_gb = SIZES[next];
+            }
             _ => {}
         }
     }

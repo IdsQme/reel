@@ -397,7 +397,18 @@ impl Client {
         Ok(Self { http })
     }
 
+    /// Addons are often small free servers, so one failed request gets one quick retry.
     async fn get_json(&self, url: &str) -> Result<Value> {
+        match self.get_json_once(url).await {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.get_json_once(url).await
+            }
+        }
+    }
+
+    async fn get_json_once(&self, url: &str) -> Result<Value> {
         let response = self.http.get(url).send().await.with_context(|| format!("requesting {url}"))?;
         let status = response.status();
         if !status.is_success() {

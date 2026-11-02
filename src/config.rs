@@ -40,6 +40,8 @@ pub struct Player {
     pub output: String,
     pub resume: bool,
     pub volume: u32,
+    /// Use mpv's high-quality profile: better scaling and debanding, a little more GPU.
+    pub high_quality: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub struct Streams {
     /// seconds per addon
     pub timeout: u64,
     pub autoplay_next: bool,
+    /// "Play best" avoids files larger than this, which need a very fast swarm to stream.
+    pub max_size_gb: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,12 +96,12 @@ impl Default for Ui {
 }
 impl Default for Player {
     fn default() -> Self {
-        Self { bin: "mpv".into(), args: vec!["--hwdec=auto".into()], output: "embedded".into(), resume: true, volume: 70 }
+        Self { bin: "mpv".into(), args: vec!["--hwdec=auto".into()], output: "embedded".into(), resume: true, volume: 70, high_quality: true }
     }
 }
 impl Default for Streams {
     fn default() -> Self {
-        Self { prefer: vec!["1080p".into(), "720p".into()], autoplay: "best".into(), timeout: 8, autoplay_next: true }
+        Self { prefer: vec!["1080p".into(), "720p".into()], autoplay: "best".into(), timeout: 8, autoplay_next: true, max_size_gb: 25 }
     }
 }
 impl Default for Subtitles {

@@ -86,6 +86,7 @@ pub struct PlayRequest {
     pub audio_only: bool,
     /// Draw into this window handle, inside the terminal.
     pub wid: Option<isize>,
+    pub high_quality: bool,
     /// "tct" or "kitty" draws video in the terminal, for `reel play --output`.
     pub terminal_vo: Option<String>,
     pub extra_args: Vec<String>,
@@ -107,6 +108,10 @@ impl PlayRequest {
             Some(vo) => args.push(format!("--vo={vo}")),
             None => {
                 args.push("--no-terminal".to_string());
+                if self.high_quality {
+                    args.push("--profile=high-quality".to_string());
+                    args.push("--deband=yes".to_string());
+                }
                 args.push(if self.audio_only { "--no-video".to_string() } else { "--force-window=immediate".to_string() });
             }
         }
@@ -434,6 +439,15 @@ mod tests {
         assert!(state.looping);
         assert_eq!(state.tracks[0].lang, "en");
         assert!(state.tracks[0].selected);
+    }
+
+    #[test]
+    fn high_quality_comes_before_user_args_so_they_can_override_it() {
+        let request = PlayRequest { target: "x".into(), high_quality: true, extra_args: vec!["--scale=bilinear".into()], ..Default::default() };
+        let args = request.args("sock");
+        let profile = args.iter().position(|a| a == "--profile=high-quality").unwrap();
+        assert!(profile < args.iter().position(|a| a == "--scale=bilinear").unwrap());
+        assert!(!PlayRequest::default().args("sock").contains(&"--profile=high-quality".to_string()));
     }
 
     #[test]

@@ -19,6 +19,7 @@ const SUB: &str = "\x1b[38;2;186;194;222m";
 const DIM: &str = "\x1b[38;2;147;153;178m";
 const MAUVE: &str = "\x1b[38;2;203;166;247m";
 const SURFACE2: &str = "\x1b[38;2;88;91;112m";
+const RED: &str = "\x1b[38;2;243;139;168m";
 const RESET: &str = "\x1b[0m";
 
 fn pad(text: &str, width: usize) -> String {
@@ -166,7 +167,10 @@ fn guess_kind(id: &str, kind: Option<&str>) -> String {
 /// All streams for an id across enabled addons, sorted for display.
 pub async fn fetch_streams(client: &Client, addons: &[Addon], kind: &str, id: &str) -> Vec<StreamRow> {
     let requests = addons.iter().enumerate().filter(|(_, a)| a.enabled && a.manifest.supports("stream", kind, id)).map(|(i, a)| async move {
-        let found = client.streams(a, kind, id).await.unwrap_or_default();
+        let found = client.streams(a, kind, id).await.unwrap_or_else(|e| {
+            eprintln!("  {RED}✗{RESET} {DIM}{}: {e:#}{RESET}", a.manifest.name);
+            Vec::new()
+        });
         found.into_iter().map(|s| streams::to_row(s, &a.manifest.name, i)).collect::<Vec<_>>()
     });
     let mut rows: Vec<StreamRow> = futures::future::join_all(requests).await.into_iter().flatten().collect();
@@ -225,7 +229,7 @@ fn truncate(text: &str, max: usize) -> String {
 pub async fn play(target: &str, quality: Option<&str>, sub: Option<&str>, kind: Option<&str>, output: Option<&str>) -> Result<()> {
     let config = Config::load()?;
     let bin = mpv::find_bin(&config.player.bin).context("mpv not found: install it or set [player] bin in config.toml")?;
-    let mut request = PlayRequest { volume: config.player.volume, extra_args: config.player.args.clone(), ..Default::default() };
+    let mut request = PlayRequest { volume: config.player.volume, extra_args: config.player.args.clone(), high_quality: config.player.high_quality, ..Default::default() };
     let output = output.unwrap_or(&config.player.output);
     match output {
         "window" | "embedded" => {}
@@ -249,7 +253,7 @@ pub async fn play(target: &str, quality: Option<&str>, sub: Option<&str>, kind: 
         let rows = fetch_streams(&client, &addons, &kind, target).await;
         let row = match quality {
             Some(q) => streams::by_quality(&rows, q).with_context(|| format!("no {q} stream for {target}"))?,
-            None => rows.get(streams::best_index(&rows, &config.streams.prefer).context("no streams found")?).context("no streams found")?,
+            None => rows.get(streams::best_index(&rows, &config.streams).context("no streams found")?).context("no streams found")?,
         };
         println!("  {GREEN}▶{RESET} {SUB}{title} · {} · via {}{RESET}", row.quality, row.addon);
         request.title = title;
@@ -280,8 +284,24 @@ pub async fn play(target: &str, quality: Option<&str>, sub: Option<&str>, kind: 
     let mut player = Mpv::spawn(&bin, &request, tx).await?;
     let control = player.control();
     if inherit {
-        // mpv owns the terminal; just wait for it.
-        let _ = player.child.wait().await;
+        // mpv owns the terminal, so only keep the torrent paced until it exits.
+        let mut state = PlayerState::default();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = player.child.wait() => break,
+                Some(event) = rx.recv() => {
+                    if let MpvEvent::Property(name, value) = event {
+                        state.apply(&name, &value);
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Some((engine, hash)) = &engine {
+                        engine.pace(hash, state.duration, state.cache_seconds, state.buffering);
+                    }
+                }
+            }
+        }
         if let Some((engine, hash)) = engine {
             engine.close(&hash).await;
         }
@@ -325,6 +345,9 @@ pub async fn play(target: &str, quality: Option<&str>, sub: Option<&str>, kind: 
                 }
             }
             _ = tick.tick() => {
+                if let Some((engine, hash)) = &engine {
+                    engine.pace(hash, state.duration, state.cache_seconds, state.buffering);
+                }
                 let filled = (state.progress() * 28.0) as usize;
                 print!(
                     "\r    {SUB}{} {MAUVE}{}╸{SURFACE2}{}{SUB} {}  vol {:.0}%{RESET}\x1b[K",

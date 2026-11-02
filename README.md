@@ -38,7 +38,7 @@ When the configured addon replaces the default, remove the old entry with `d`.
 
 Torrentio without a debrid service returns torrents. reel streams those with its built-in BitTorrent engine, which
 **uploads to other peers and exposes your IP address to the swarm while playing**, like any torrent client. Downloaded data
-is deleted when playback stops. With a debrid service configured, streams are direct HTTPS and no torrent traffic happens.
+is deleted when playback stops, or at the next launch after a crash. Once mpv has a healthy buffer, reel limits the download to about twice the film's bitrate, so it doesn't fetch far ahead of you. With a debrid service configured, streams are direct HTTPS and no torrent traffic happens.
 You are responsible for what you stream and whether it is legal where you live.
 
 ## CLI
@@ -54,9 +54,9 @@ reel play ~/Films/Detour.1945.mkv
 reel play tt0017136 --output tct
 ```
 
-In the TUI, video plays inside reel's Now Playing screen, and `f` switches to theater mode. This uses mpv's `--wid` with a child of the terminal window, so it needs Windows Terminal or the classic Windows console. Elsewhere, or with `output = "window"` in the config, mpv opens its own window. `P` on a stream picks for one play.
+In the TUI, video plays inside reel's Now Playing screen, `t` switches to theater mode and `f` or `F11` to fullscreen (`esc` leaves). This uses mpv's `--wid` with a child of the terminal window, so it needs Windows Terminal or the classic Windows console. Elsewhere, or with `output = "window"` in the config, mpv opens its own window. `P` on a stream picks for one play.
 
-The mouse works everywhere: click tabs, buttons and rows (a second click opens what is selected), scroll lists, and right-click to go back. Now Playing has a control bar with a seek bar and volume you can click or drag. On the video itself, mpv's own controls appear when you hover: click to pause, double-click for theater mode. Hold `Shift` while dragging to select text in the terminal.
+The mouse works everywhere: click tabs, buttons and rows (a second click opens what is selected), scroll lists, and right-click to go back. Now Playing has a control bar with a seek bar and volume you can click or drag. On the video itself, mpv's own controls appear when you hover: click to pause, double-click for fullscreen. Hold `Shift` while dragging to select text in the terminal.
 
 `--output` takes `window`, `fullscreen` or an mpv terminal video output such as `tct`, `kitty` or `sixel`.
 
@@ -74,6 +74,10 @@ Press `?` in the app for the full list.
 | `+` | Add to or remove from library |
 | `S` `G` `Y` | Cycle sort, genre, year |
 | `q` | Quit, or stop on Now Playing |
+
+## Picture quality
+
+reel picks streams for you with `p`: it skips dead torrents and camrips (shown as a red `CAM`), then picks the largest file with a healthy swarm, up to `[streams] max_size_gb` (25 by default). Bigger files look better but need more bandwidth. mpv runs with its `high-quality` profile, which you can turn off under Settings as "Video quality".
 
 ## Configuration
 

@@ -7,9 +7,10 @@ use ratatui::layout::Rect;
 mod imp {
     use super::Rect;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::mpsc::channel;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
+    use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
     use windows_sys::Win32::System::Console::GetConsoleWindow;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext};
@@ -21,8 +22,41 @@ mod imp {
     const PADDING_DIP: f64 = 8.0;
     const SCROLLBAR_DIP: f64 = 16.0;
 
+    const SET_FULLSCREEN: u32 = WM_APP + 1;
+    const CHILD_STYLE: u32 = WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+    static TERMINAL: AtomicIsize = AtomicIsize::new(0);
+    static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+    /// Lifts the video out of the terminal to cover its monitor, or puts it back.
+    /// It never takes activation, so the terminal keeps the keyboard either way.
+    unsafe fn apply_fullscreen(hwnd: HWND, on: bool) {
+        unsafe {
+            let terminal = TERMINAL.load(Ordering::Relaxed) as HWND;
+            if on {
+                let mut info: MONITORINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                GetMonitorInfoW(MonitorFromWindow(terminal, MONITOR_DEFAULTTONEAREST), &mut info);
+                let screen = info.rcMonitor;
+                SetParent(hwnd, std::ptr::null_mut());
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_CLIPCHILDREN) as isize);
+                SetWindowPos(hwnd, HWND_TOPMOST, screen.left, screen.top, screen.right - screen.left, screen.bottom - screen.top, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+            } else {
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, CHILD_STYLE as isize);
+                SetParent(hwnd, terminal);
+                SetWindowPos(hwnd, HWND_TOP, 0, 0, 1, 1, SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
+        }
+    }
+
     unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        unsafe {
+            if message == SET_FULLSCREEN {
+                apply_fullscreen(hwnd, wparam != 0);
+                return 0;
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
     }
 
     fn wide(text: &str) -> Vec<u16> {
@@ -49,12 +83,14 @@ mod imp {
         terminal: isize,
         tabbed: bool,
         placed: Mutex<Option<(i32, i32, i32, i32)>>,
+        fullscreen: AtomicBool,
     }
 
     impl VideoHost {
         pub fn create() -> Option<Self> {
             let (terminal, tabbed) = terminal_window()?;
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+            TERMINAL.store(terminal, Ordering::Relaxed);
             let (tx, rx) = channel();
             // A child of another process's window needs its own thread pumping messages.
             std::thread::spawn(move || unsafe {
@@ -74,10 +110,10 @@ mod imp {
                 };
                 RegisterClassW(&definition);
                 let hwnd = CreateWindowExW(
-                    WS_EX_NOACTIVATE,
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                     class.as_ptr(),
                     std::ptr::null(),
-                    WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                    CHILD_STYLE,
                     0,
                     0,
                     1,
@@ -90,6 +126,7 @@ mod imp {
                 let _ = tx.send(hwnd as isize);
                 SetTimer(std::ptr::null_mut(), 0, 100, None);
                 let mut typing_target = terminal as HWND;
+                let mut on_top = true;
                 let mut message: MSG = std::mem::zeroed();
                 while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
                     DispatchMessageW(&message);
@@ -98,6 +135,24 @@ mod imp {
                     let video = GetWindow(hwnd, GW_CHILD);
                     if !video.is_null() && IsWindowEnabled(video) == 0 {
                         EnableWindow(video, 1);
+                    }
+                    // A fullscreen video stays on top only while reel is in use, so
+                    // switching to another app works.
+                    if FULLSCREEN.load(Ordering::Relaxed) {
+                        let active = GetForegroundWindow();
+                        let ours = active == terminal as HWND || active == hwnd || IsChild(hwnd, active) != 0;
+                        if ours != on_top {
+                            on_top = ours;
+                            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+                            if ours {
+                                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                            } else {
+                                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+                                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
+                            }
+                        }
+                    } else {
+                        on_top = true;
                     }
                     // A click on the video gives mpv the keyboard. Once the button is up
                     // (a seek drag needs it until then), hand it back so reel's keys work.
@@ -115,7 +170,7 @@ mod imp {
                 }
             });
             let hwnd = rx.recv().ok().filter(|h| *h != 0)?;
-            Some(Self { hwnd, terminal, tabbed, placed: Mutex::new(None) })
+            Some(Self { hwnd, terminal, tabbed, placed: Mutex::new(None), fullscreen: AtomicBool::new(false) })
         }
 
         pub fn wid(&self) -> isize {
@@ -137,8 +192,20 @@ mod imp {
             (x.round() as i32, y.round() as i32, (cells.width as f64 * cell_w).round() as i32, (cells.height as f64 * cell_h).round() as i32)
         }
 
+        pub fn set_fullscreen(&self, on: bool) {
+            if self.fullscreen.swap(on, Ordering::Relaxed) != on {
+                FULLSCREEN.store(on, Ordering::Relaxed);
+                // Forget the old position so leaving fullscreen places it again.
+                *self.placed.lock().unwrap() = None;
+                unsafe { PostMessageW(self.hwnd as HWND, SET_FULLSCREEN, on as usize, 0) };
+            }
+        }
+
         /// Moves the video over these cells, or hides it with None.
         pub fn place(&self, cells: Option<Rect>, cols: u16, rows: u16) {
+            if self.fullscreen.load(Ordering::Relaxed) {
+                return;
+            }
             let target = cells.map(|c| self.pixels(c, cols, rows));
             let mut placed = self.placed.lock().unwrap();
             if *placed == target {
@@ -189,6 +256,8 @@ impl VideoHost {
     }
 
     pub fn place(&self, _cells: Option<Rect>, _cols: u16, _rows: u16) {}
+
+    pub fn set_fullscreen(&self, _on: bool) {}
 }
 
 #[cfg(not(windows))]
