@@ -38,7 +38,7 @@ When the configured addon replaces the default, remove the old entry with `d`.
 
 Torrentio without a debrid service returns torrents. reel streams those with its built-in BitTorrent engine, which
 **uploads to other peers and exposes your IP address to the swarm while playing**, like any torrent client. Downloaded data
-is deleted when playback stops, or at the next launch after a crash. Once mpv has a healthy buffer, reel limits the download to about twice the film's bitrate, so it doesn't fetch far ahead of you. With a debrid service configured, streams are direct HTTPS and no torrent traffic happens.
+is deleted when playback stops or the terminal window is closed, or at the next launch after a crash. Once mpv has a healthy buffer, reel limits the download to about twice the film's bitrate, so it doesn't fetch far ahead of you. With a debrid service configured, streams are direct HTTPS and no torrent traffic happens.
 You are responsible for what you stream and whether it is legal where you live.
 
 ## CLI

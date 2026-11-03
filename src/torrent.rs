@@ -53,6 +53,39 @@ pub fn sweep_stale() {
     }
 }
 
+/// Closing the terminal window ends reel without running its normal shutdown, so Windows'
+/// close notification is used to delete this run's stream data first.
+#[cfg(windows)]
+mod exit_cleanup {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler};
+
+    static FOLDER: OnceLock<PathBuf> = OnceLock::new();
+
+    unsafe extern "system" fn on_console_event(event: u32) -> i32 {
+        if matches!(event, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT)
+            && let Some(folder) = FOLDER.get()
+        {
+            for _ in 0..10 {
+                if std::fs::remove_dir_all(folder).is_ok() || !folder.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        // Not handled, so Windows goes on to end the process as usual.
+        0
+    }
+
+    pub fn register(folder: PathBuf) {
+        if FOLDER.set(folder).is_ok() {
+            unsafe { SetConsoleCtrlHandler(Some(on_console_event), 1) };
+        }
+    }
+}
+
 /// The paced rate for a film of this size and length, in bytes per second.
 fn paced_bps(total_bytes: u64, duration: f64) -> u32 {
     (total_bytes as f64 / duration * PACE_MULTIPLE).max(PACE_FLOOR_BPS).min(u32::MAX as f64) as u32
@@ -111,6 +144,8 @@ impl Engine {
         tokio::fs::create_dir_all(&folder).await?;
         let lock = File::options().create(true).truncate(false).write(true).open(folder.join(LOCK_FILE))?;
         lock.try_lock().context("locking torrent cache")?;
+        #[cfg(windows)]
+        exit_cleanup::register(folder.clone());
         let _ = tokio::task::spawn_blocking(sweep_stale).await;
         let session = Session::new_with_opts(folder, SessionOptions { ..Default::default() }).await.context("starting torrent engine")?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
