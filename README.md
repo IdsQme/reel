@@ -7,20 +7,23 @@ in the terminal with sixel, kitty graphics or half blocks.
 
 Run `reel` with no arguments to open the TUI.
 
-## Build
+## Install
 
-Needs Rust and mpv. On Windows, `build.ps1` builds without Visual Studio, using the `stable-x86_64-pc-windows-gnullvm` toolchain and MSYS2's clang64:
+On Windows 10 or 11, run this in PowerShell:
 
 ```powershell
-rustup toolchain install stable-x86_64-pc-windows-gnullvm --profile minimal
-.\build.ps1
+irm https://raw.githubusercontent.com/IdsQme/reel/main/install.ps1 | iex
 ```
 
-The result is `target\release\reel.exe`, a single file with no extra DLLs. reel finds mpv on `PATH`,
-in `C:\Program Files\MPV Player`, in the other common install folders, or from `[player] bin` in the config.
+Then open a new terminal and run `reel`.
 
-Use Windows Terminal 1.22 or newer, or another terminal with sixel or kitty graphics, for full-resolution posters.
-Other terminals get half-block posters.
+It uses winget to install mpv, yt-dlp, Deno, Rust and, if you don't already have a C compiler, LLVM-MinGW. It builds reel from source, which takes a few minutes, installs it to `%LOCALAPPDATA%\Programs\reel`, and adds reel, mpv, yt-dlp, Deno and Rust to your user PATH. Run it again to update. Windows may ask for permission while installing mpv.
+
+The build tools stay installed afterwards and take up a few GB. Remove them with `rustup self uninstall` if you don't plan to update reel. To read the script before running it, download `install.ps1` first. From a clone, run `.\install.ps1`, adding `-WithFirefox` to also install Firefox, which is only needed for YouTube sign-in.
+
+Use Windows Terminal 1.22 or newer, or another terminal with sixel or kitty graphics, for full-resolution posters. Other terminals get half-block posters.
+
+To build by hand, run `.\build.ps1`, which uses MSYS2's clang64 and the `stable-x86_64-pc-windows-gnullvm` toolchain.
 
 ## Addons
 
