@@ -5,8 +5,10 @@ use crate::cli;
 use crate::config::{self, AddonEntry, Config, Progress, State};
 use crate::embed::VideoHost;
 use crate::mpv::{self, Mpv, MpvControl, MpvEvent, PlayRequest, PlayerState};
+use crate::room::{self, Control, Guest, Host, LoadOffer, RoomEvent, SyncState};
 use crate::streams::{self, StreamRow};
 use crate::torrent::{Engine, TorrentStatus};
+use crate::youtube;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use image::DynamicImage;
 use ratatui::layout::Rect;
@@ -32,6 +34,10 @@ pub enum Ev {
     PreviewDue(u64),
     SearchDue(u64),
     Search { generation: u64, items: Vec<Meta>, ms: u128 },
+    YoutubeSignIn(Result<bool, String>),
+    Room(RoomEvent),
+    RoomHostStarted(Result<Box<Host>, String>),
+    RoomJoined(Result<Box<Guest>, String>),
     PosterRaw(String, Option<DynamicImage>),
     PosterEncoded(PosterKey, Option<Protocol>),
     Installed(Result<Box<Addon>, String>),
@@ -48,6 +54,7 @@ pub enum Screen {
     Library,
     Addons,
     Settings,
+    Room,
     Details,
     Playing,
 }
@@ -96,6 +103,8 @@ pub enum Hit {
     UpNext(usize),
     /// Audio or subtitle track; id 0 turns subtitles off.
     Track(&'static str, i64),
+    Chapter(usize),
+    RoomGuest(usize),
     Seek,
     Volume,
 }
@@ -219,6 +228,45 @@ pub struct Playing {
     pub mpv_fullscreen: Option<bool>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomInput {
+    Invite,
+    GuestId,
+}
+
+pub struct RoomGuestRow {
+    pub id: iroh::EndpointId,
+    pub words: String,
+    pub joined: bool,
+}
+
+/// Networking only starts inside a room, so this costs nothing the rest of the time.
+#[derive(Default)]
+pub struct RoomView {
+    pub my_id: String,
+    pub host: Option<Box<Host>>,
+    pub guest: Option<Box<Guest>>,
+    pub starting: bool,
+    pub input: Option<(RoomInput, String)>,
+    pub invite_code: Option<String>,
+    pub guests: Vec<RoomGuestRow>,
+    pub cursor: usize,
+    /// As a guest: the safety words, and whether the host has let us in.
+    pub words: Option<String>,
+    pub admitted: bool,
+    /// As a guest: what the host wants to watch. It never starts without a yes.
+    pub offer: Option<LoadOffer>,
+    pub status: Option<(bool, String)>,
+    /// As a host: whether what is playing was shared with the room.
+    pub sharing: bool,
+    pub torrent_hint: Option<String>,
+    pub last_correction: Option<Instant>,
+}
+
+/// How far a guest may drift before being corrected, and how long it gets to catch up.
+const ROOM_MAX_DRIFT_SECONDS: f64 = 2.0;
+const ROOM_CORRECTION_GAP: Duration = Duration::from_secs(4);
+
 pub struct AddonsView {
     pub cursor: usize,
     pub input: Option<String>,
@@ -226,8 +274,8 @@ pub struct AddonsView {
     pub confirm_remove: bool,
 }
 
-pub const SETTINGS: [&str; 12] =
-    ["Accent", "Posters", "Output", "Resume", "Volume", "Prefer quality", "Autoplay", "Autoplay next", "Addon timeout", "Subtitles auto", "Video quality", "Best max size"];
+pub const SETTINGS: [&str; 13] =
+    ["Accent", "Posters", "Output", "Resume", "Volume", "Prefer quality", "Autoplay", "Autoplay next", "Addon timeout", "Subtitles auto", "Video quality", "Best max size", "YouTube account"];
 
 pub struct App {
     pub config: Config,
@@ -254,16 +302,35 @@ pub struct App {
     pub toast: Option<(bool, String, Instant)>,
     pub preview_generation: u64,
     pub grid_shape: Cell<(usize, usize)>,
+    /// Inner size of a grid poster in cells, set while drawing.
+    pub poster_size: Cell<(u16, u16)>,
     pub mpv_bin: Option<std::path::PathBuf>,
     pub engine: Arc<OnceCell<Arc<Engine>>>,
     pub should_quit: bool,
     pub needs_clear: bool,
+    /// Something visible changed since the last frame.
+    pub dirty: bool,
+    pub room: RoomView,
+    pub youtube_signed_in: bool,
+    youtube_signing_in: bool,
     /// Cells the embedded video should cover this frame, set while drawing.
     pub video_cells: Cell<Option<Rect>>,
     pub frame_size: Cell<(u16, u16)>,
     pub hits: RefCell<Vec<(Rect, Hit)>>,
     video_host: Option<Arc<VideoHost>>,
     posters_http: reqwest::Client,
+}
+
+const MAX_CACHED_STREAM_SETS: usize = 32;
+const MAX_CACHED_METAS: usize = 128;
+
+fn is_frequent_property(name: &str) -> bool {
+    matches!(name, "time-pos" | "demuxer-cache-duration" | "cache-speed" | "frame-drop-count")
+}
+
+/// The fast-changing values as the screen shows them, to spot when a redraw would change nothing.
+fn visible_numbers(state: &PlayerState) -> (i64, i64, i64, i64) {
+    (state.position as i64, state.cache_seconds as i64, (state.cache_speed / 104_857.6) as i64, state.dropped)
 }
 
 fn now_secs() -> u64 {
@@ -366,10 +433,15 @@ impl App {
             toast: None,
             preview_generation: 0,
             grid_shape: Cell::new((5, 2)),
+            poster_size: Cell::new((0, 0)),
             mpv_bin,
             engine: Arc::new(OnceCell::new()),
             should_quit: false,
             needs_clear: false,
+            dirty: true,
+            room: RoomView::default(),
+            youtube_signed_in: youtube::signed_in(),
+            youtube_signing_in: false,
             video_cells: Cell::new(None),
             frame_size: Cell::new((0, 0)),
             hits: RefCell::new(Vec::new()),
@@ -394,6 +466,7 @@ impl App {
     }
 
     pub fn after_draw(&mut self) {
+        self.prefetch_next_page();
         self.posters.process(&self.posters_http, &self.tx);
         if let Some(host) = &self.video_host {
             let (cols, rows) = self.frame_size.get();
@@ -403,9 +476,41 @@ impl App {
         }
     }
 
+    /// Readies the next page's thumbnails so paging shows them at once.
+    fn prefetch_next_page(&self) {
+        if self.screen != Screen::Discover {
+            return;
+        }
+        let (cols, rows) = self.grid_shape.get();
+        let page_size = cols * rows;
+        let (w, h) = self.poster_size.get();
+        if page_size == 0 || w == 0 || page_size * 2 > super::poster::MAX_RENDERED {
+            return;
+        }
+        let order = self.visible();
+        let start = (self.discover.cursor / page_size + 1) * page_size;
+        for &i in order.iter().skip(start).take(page_size) {
+            if let Some(url) = self.discover.items[i].poster_url() {
+                self.posters.get(&url, w, h);
+            }
+        }
+    }
+
     pub async fn shutdown(&mut self) {
         self.save_progress();
         self.state.save();
+        if self.in_room() {
+            let (host, guest) = (self.room.host.take(), self.room.guest.take());
+            let closing = async {
+                if let Some(host) = host {
+                    host.close().await;
+                }
+                if let Some(guest) = guest {
+                    guest.close().await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(1), closing).await;
+        }
         if let Some(control) = self.playing.as_ref().and_then(|p| p.control.as_ref()) {
             control.command(json!(["quit"]));
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -481,6 +586,10 @@ impl App {
         self.discover.error = None;
         let (generation, client, tx) = (self.discover.generation, self.client.clone(), self.tx.clone());
         tokio::spawn(async move {
+            // Show the last saved list right away while the fresh one loads.
+            if def.kind == "youtube" && !append && let Some(items) = youtube::saved_feed(&def.id) {
+                let _ = tx.send(Ev::Catalog { generation, items, append: false, ms: 0, error: None });
+            }
             let started = Instant::now();
             let result = client.catalog(&addon, &def, &extra).await;
             let ms = started.elapsed().as_millis();
@@ -565,6 +674,13 @@ impl App {
     fn fetch_streams(&mut self, kind: &str, video_id: &str) {
         if self.stream_cache.get(video_id).is_some_and(|set| set.pending > 0 || set.errors.is_empty()) {
             return;
+        }
+        if self.stream_cache.len() >= MAX_CACHED_STREAM_SETS {
+            let current = self.details.as_ref().map(|d| d.video_id.clone());
+            self.stream_cache.retain(|id, set| set.pending > 0 || Some(id) == current.as_ref());
+        }
+        if self.meta_cache.len() >= MAX_CACHED_METAS {
+            self.meta_cache.clear();
         }
         let targets: Vec<(usize, Addon)> = self.addons.iter().cloned().enumerate().filter(|(_, a)| a.enabled && a.manifest.supports("stream", kind, video_id)).collect();
         self.stream_cache.insert(video_id.to_string(), StreamSet { pending: targets.len(), total: targets.len(), ..Default::default() });
@@ -725,7 +841,11 @@ impl App {
         }
         let (meta, video_id) = self.pending_play.take().unwrap();
         let rows = self.stream_cache.get(&video_id).map(|s| s.rows.clone()).unwrap_or_default();
-        match streams::best_index(&rows, &self.config.streams) {
+        // The host's torrent keeps everyone on the same file, but only if this reel's own
+        // addons list it too, so a host can never push an arbitrary torrent onto a guest.
+        let hint = self.room.torrent_hint.take();
+        let same_file = hint.and_then(|hash| rows.iter().position(|r| r.stream.info_hash.as_deref() == Some(hash.as_str())));
+        match same_file.or_else(|| streams::best_index(&rows, &self.config.streams)) {
             Some(i) => self.start_play(meta, video_id, rows[i].clone(), None, PlayMode::Configured),
             None => {
                 self.toast(false, format!("no streams found for {}", meta.name));
@@ -851,6 +971,10 @@ impl App {
             subs: picked,
             sub_select: selected,
         };
+        if youtube::is_youtube_url(&request.target) {
+            request.extra_args.extend(youtube::mpv_args());
+        }
+        self.announce_to_room(&meta, &video_id, &request.title, row.stream.info_hash.clone());
         let (tx, engine) = (self.tx.clone(), self.engine.clone());
         let stream = row.stream.clone();
         tokio::spawn(async move {
@@ -956,8 +1080,312 @@ impl App {
         self.check_pending_play();
     }
 
-    pub fn handle(&mut self, event: Ev) {
+    /// Starts Google's sign-in in its own browser window and reloads when it closes.
+    fn start_youtube_sign_in(&mut self) {
+        if self.youtube_signing_in {
+            return;
+        }
+        self.youtube_signing_in = true;
+        self.toast(true, "sign in to Google in the Firefox window, then close it");
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = youtube::sign_in().await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Ev::YoutubeSignIn(result));
+        });
+    }
+
+    fn current_catalog_is_youtube(&self) -> bool {
+        self.current_catalog().is_some_and(|c| c.def.kind == "youtube")
+    }
+
+    fn start_room(&mut self) {
+        if self.room.starting || self.in_room() {
+            return;
+        }
+        let secret = match room::load_identity() {
+            Ok(secret) => secret,
+            Err(e) => {
+                self.room.status = Some((false, format!("{e:#}")));
+                return;
+            }
+        };
+        self.room.starting = true;
+        self.room.status = Some((true, "starting the room…".to_string()));
+        let (tx, events) = (self.tx.clone(), self.room_events());
+        tokio::spawn(async move {
+            let host = Host::start(secret, events).await.map(Box::new).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Ev::RoomHostStarted(host));
+        });
+    }
+
+    fn join_room(&mut self, code: &str) {
+        if self.room.starting || self.in_room() {
+            return;
+        }
+        let secret = match room::load_identity() {
+            Ok(secret) => secret,
+            Err(e) => {
+                self.room.status = Some((false, format!("{e:#}")));
+                return;
+            }
+        };
+        self.room.starting = true;
+        self.room.status = Some((true, "connecting to the host…".to_string()));
+        let (tx, events, code) = (self.tx.clone(), self.room_events(), code.to_string());
+        tokio::spawn(async move {
+            let guest = Guest::join(secret, &code, events).await.map(Box::new).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Ev::RoomJoined(guest));
+        });
+    }
+
+    fn room_events(&self) -> mpsc::UnboundedSender<RoomEvent> {
+        let (events, mut incoming) = mpsc::unbounded_channel();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = incoming.recv().await {
+                if tx.send(Ev::Room(event)).is_err() {
+                    break;
+                }
+            }
+        });
+        events
+    }
+
+    pub fn in_room(&self) -> bool {
+        self.room.host.is_some() || self.room.guest.is_some()
+    }
+
+    fn leave_room(&mut self) {
+        let host = self.room.host.take();
+        let guest = self.room.guest.take();
+        tokio::spawn(async move {
+            if let Some(host) = host {
+                host.close().await;
+            }
+            if let Some(guest) = guest {
+                guest.close().await;
+            }
+        });
+        let my_id = std::mem::take(&mut self.room.my_id);
+        self.room = RoomView { my_id, ..Default::default() };
+    }
+
+    fn on_room_event(&mut self, event: RoomEvent) {
         match event {
+            RoomEvent::GuestWaiting { id, words } => {
+                self.room.guests.retain(|g| g.id != id);
+                self.room.guests.push(RoomGuestRow { id, words, joined: false });
+                self.toast(true, "someone you invited is waiting: open Room (6) and compare safety words");
+            }
+            RoomEvent::GuestJoined { id } => {
+                if let Some(guest) = self.room.guests.iter_mut().find(|g| g.id == id) {
+                    guest.joined = true;
+                }
+                self.host_sync();
+            }
+            RoomEvent::GuestLeft { id } => {
+                self.room.guests.retain(|g| g.id != id);
+                self.room.cursor = self.room.cursor.min(self.room.guests.len().saturating_sub(1));
+            }
+            RoomEvent::Refused { id } => {
+                self.room.status = Some((false, format!("refused {}: no valid invite", room::short_id(&id))));
+            }
+            RoomEvent::GuestControl { control, .. } => {
+                if let Some(player) = self.playing.as_ref().and_then(|p| p.control.as_ref()) {
+                    match control {
+                        Control::Pause => player.command(json!(["set_property", "pause", true])),
+                        Control::Resume => player.command(json!(["set_property", "pause", false])),
+                        Control::Seek { position } => player.command(json!(["seek", position, "absolute"])),
+                    }
+                }
+            }
+            RoomEvent::Connected { words } => {
+                self.room.words = Some(words);
+                self.room.status = Some((true, "waiting for the host to let you in".to_string()));
+            }
+            RoomEvent::Admitted => {
+                self.room.admitted = true;
+                self.room.status = Some((true, "you are in the room".to_string()));
+            }
+            RoomEvent::Load(offer) => {
+                self.toast(true, format!("the host wants to watch {}: open Room (6) to accept", offer.title));
+                self.room.offer = Some(offer);
+            }
+            RoomEvent::State(state) => self.follow_host(state),
+            RoomEvent::Closed(reason) => {
+                self.leave_room();
+                self.room.status = Some((false, format!("left the room: {reason}")));
+            }
+        }
+    }
+
+    /// Keeps a guest's own player close to the host's. It never starts anything new.
+    fn follow_host(&mut self, state: SyncState) {
+        let last_correction = self.room.last_correction;
+        let Some(p) = &self.playing else { return };
+        let Some(control) = &p.control else { return };
+        if p.state.paused != state.paused {
+            control.command(json!(["set_property", "pause", state.paused]));
+        }
+        if (p.state.speed - state.speed).abs() > 0.01 {
+            control.command(json!(["set_property", "speed", state.speed]));
+        }
+        let settled = last_correction.is_none_or(|at| at.elapsed() >= ROOM_CORRECTION_GAP);
+        if settled && !p.state.buffering && (p.state.position - state.position).abs() > ROOM_MAX_DRIFT_SECONDS {
+            control.command(json!(["seek", state.position, "absolute"]));
+            self.room.last_correction = Some(Instant::now());
+        }
+    }
+
+    /// Tells guests where the host's player is.
+    fn host_sync(&self) {
+        let (Some(host), Some(p)) = (&self.room.host, &self.playing) else { return };
+        if !self.room.sharing || p.control.is_none() || p.state.duration <= 0.0 {
+            return;
+        }
+        host.sync(SyncState { position: p.state.position.max(0.0), paused: p.state.paused, speed: p.state.speed.clamp(0.25, 4.0) });
+    }
+
+    /// Offers what the host just started to the room. Local files stay private.
+    fn announce_to_room(&mut self, meta: &Meta, video_id: &str, title: &str, hash: Option<String>) {
+        let Some(host) = &self.room.host else { return };
+        let offer = LoadOffer { meta_id: meta.id.clone(), video_id: video_id.to_string(), kind: meta.kind.clone(), title: room::clean_title(title), hash };
+        self.room.sharing = room::can_share(&offer.meta_id, &offer.video_id) && matches!(offer.kind.as_str(), "movie" | "series" | "anime" | "youtube");
+        if self.room.sharing {
+            host.load(offer);
+        } else {
+            self.toast(false, "this can't be shared with the room, so only you are watching it");
+        }
+    }
+
+    /// A guest said yes: find this title with the guest's own addons and play it.
+    fn accept_room_offer(&mut self) {
+        let Some(offer) = self.room.offer.take() else { return };
+        let poster = offer.meta_id.strip_prefix(youtube::ID_PREFIX).map(|id| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")).unwrap_or_default();
+        let meta = Meta { id: offer.meta_id.clone(), kind: offer.kind.clone(), name: offer.title.clone(), poster, ..Default::default() };
+        self.room.torrent_hint = offer.hash;
+        self.fetch_streams(&offer.kind, &offer.video_id);
+        self.fetch_subs(&offer.kind, &offer.video_id);
+        self.toast(true, format!("finding streams for {}", meta.name));
+        self.pending_play = Some((meta, offer.video_id));
+        self.check_pending_play();
+    }
+
+    fn on_room_input_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some((kind, text)) = &mut self.room.input else { return };
+        match key.code {
+            KeyCode::Esc => self.room.input = None,
+            KeyCode::Char('u') if ctrl => text.clear(),
+            KeyCode::Char(c) if !ctrl => text.push(c),
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Enter => {
+                let (kind, text) = (*kind, text.trim().to_string());
+                self.room.input = None;
+                match kind {
+                    RoomInput::Invite => self.join_room(&text),
+                    RoomInput::GuestId => self.create_invite(&text),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn create_invite(&mut self, text: &str) {
+        let Some(host) = &self.room.host else { return };
+        match room::parse_id(text).and_then(|id| host.invite(id)) {
+            Ok(code) => {
+                copy_to_clipboard(&code);
+                self.room.invite_code = Some(code);
+                self.room.status = Some((true, "invite copied: send it to them. It only works for that reel ID, once, for 15 minutes".to_string()));
+            }
+            Err(e) => self.room.status = Some((false, e.to_string())),
+        }
+    }
+
+    fn on_room_key(&mut self, key: KeyEvent) {
+        let hosting = self.room.host.is_some();
+        match key.code {
+            KeyCode::Esc => self.go(Screen::Discover),
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('y') => {
+                let text = self.room.invite_code.clone().filter(|_| hosting).unwrap_or_else(|| self.room.my_id.clone());
+                copy_to_clipboard(&text);
+                self.toast(true, if hosting && self.room.invite_code.is_some() { "invite copied" } else { "your reel ID copied" });
+            }
+            KeyCode::Char('n') if !self.in_room() => self.start_room(),
+            KeyCode::Char('i') if !self.in_room() => self.room.input = Some((RoomInput::Invite, String::new())),
+            KeyCode::Char('i') if hosting => self.room.input = Some((RoomInput::GuestId, String::new())),
+            KeyCode::Char('l') if self.in_room() => self.leave_room(),
+            KeyCode::Char('j') | KeyCode::Down => self.room.cursor = (self.room.cursor + 1).min(self.room.guests.len().saturating_sub(1)),
+            KeyCode::Char('k') | KeyCode::Up => self.room.cursor = self.room.cursor.saturating_sub(1),
+            KeyCode::Enter if hosting => {
+                if let (Some(host), Some(row)) = (&self.room.host, self.room.guests.get(self.room.cursor)) {
+                    if !row.joined {
+                        host.decide(&row.id, true);
+                    }
+                }
+            }
+            KeyCode::Char('d') if hosting => {
+                if let (Some(host), Some(row)) = (&self.room.host, self.room.guests.get(self.room.cursor)) {
+                    host.decide(&row.id, false);
+                    host.remove(&row.id);
+                }
+            }
+            KeyCode::Enter if self.room.guest.is_some() => self.accept_room_offer(),
+            _ => {}
+        }
+    }
+
+    /// As a guest, transport keys ask the host, who applies them for everyone.
+    fn guest_control(&self, control: Control) -> bool {
+        match &self.room.guest {
+            Some(guest) if self.room.admitted => {
+                guest.control(control);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn handle(&mut self, event: Ev) {
+        // Ticks and mpv's constant property updates decide for themselves.
+        self.dirty |= !matches!(event, Ev::Tick | Ev::Mpv(..));
+        match event {
+            Ev::Room(event) => self.on_room_event(event),
+            Ev::RoomHostStarted(result) => {
+                self.room.starting = false;
+                match result {
+                    Ok(host) => {
+                        self.room.host = Some(host);
+                        self.room.status = Some((true, "room open: press i and paste your friend's reel ID".to_string()));
+                    }
+                    Err(error) => self.room.status = Some((false, error)),
+                }
+            }
+            Ev::RoomJoined(result) => {
+                self.room.starting = false;
+                match result {
+                    Ok(guest) => self.room.guest = Some(guest),
+                    Err(error) => self.room.status = Some((false, error)),
+                }
+            }
+            Ev::YoutubeSignIn(result) => {
+                self.youtube_signing_in = false;
+                match result {
+                    Ok(true) => {
+                        self.youtube_signed_in = true;
+                        self.toast(true, "signed in to YouTube");
+                        if self.current_catalog_is_youtube() {
+                            self.load_catalog(false);
+                        }
+                    }
+                    Ok(false) => self.toast(false, "not signed in: the Firefox window closed before sign-in finished"),
+                    Err(error) => self.toast(false, error),
+                }
+            }
             Ev::Key(key) => self.on_key(key),
             Ev::Mouse(mouse) => self.on_mouse(mouse),
             Ev::Paste(text) => self.on_paste(&text),
@@ -980,6 +1408,10 @@ impl App {
                     return;
                 }
                 self.discover.loading = false;
+                // A failed refresh keeps the saved list that is already showing.
+                if error.is_some() && !self.discover.items.is_empty() {
+                    return;
+                }
                 self.discover.ms = Some(ms);
                 self.discover.error = error;
                 self.discover.has_more = !items.is_empty();
@@ -990,6 +1422,7 @@ impl App {
                     self.discover.items.extend(fresh);
                 } else {
                     self.discover.items = items;
+                    self.discover.cursor = self.discover.cursor.min(self.discover.items.len().saturating_sub(1));
                 }
                 self.schedule_preview();
             }
@@ -1098,16 +1531,22 @@ impl App {
 
     fn on_mpv(&mut self, session: u64, event: MpvEvent) {
         if let MpvEvent::Closed = event {
+            self.dirty = true;
             self.on_mpv_closed(session);
             return;
         }
+        let on_screen = self.screen == Screen::Playing;
+        let paused_changed = matches!(&event, MpvEvent::Property(name, _) if name == "pause");
         let Some(p) = &mut self.playing else { return };
         if p.session != session {
             return;
         }
         match event {
             MpvEvent::Property(name, value) => {
+                let before = visible_numbers(&p.state);
                 p.state.apply(&name, &value);
+                // mpv reports the position every frame; redraw only when a number on screen moves.
+                self.dirty |= if on_screen { before != visible_numbers(&p.state) || !is_frequent_property(&name) } else { name == "pause" };
                 if name == "fullscreen" {
                     let now = value.as_bool().unwrap_or(false);
                     if p.embedded && p.mpv_fullscreen.is_some_and(|before| before != now) {
@@ -1130,6 +1569,7 @@ impl App {
                 }
             }
             MpvEvent::Log(name, detail) => {
+                self.dirty |= on_screen;
                 let detail = if name == "seek" { format!("from {}", mpv::format_time(p.state.position)) } else { detail };
                 p.log.push_back((clock(), name, detail));
             }
@@ -1139,12 +1579,18 @@ impl App {
         while p.log.len() > 50 {
             p.log.pop_front();
         }
+        if paused_changed {
+            self.host_sync();
+        }
     }
 
     fn on_tick(&mut self) {
         if self.toast.as_ref().is_some_and(|t| t.2.elapsed() > Duration::from_secs(6)) {
             self.toast = None;
+            self.dirty = true;
         }
+        // Torrent speed and peers change on their own while watching.
+        self.dirty |= self.screen == Screen::Playing && self.playing.as_ref().is_some_and(|p| p.hash.is_some());
         crate::embed::hide_console_stub();
         let engine = self.engine.get().cloned();
         let mut save = false;
@@ -1155,6 +1601,7 @@ impl App {
             }
             save = p.last_saved.elapsed() > Duration::from_secs(10);
         }
+        self.host_sync();
         if save {
             self.save_progress();
         }
@@ -1162,7 +1609,9 @@ impl App {
 
     fn on_paste(&mut self, text: &str) {
         let clean = text.trim();
-        if let Some(input) = &mut self.addons_view.input {
+        if let Some((_, input)) = &mut self.room.input {
+            input.push_str(clean);
+        } else if let Some(input) = &mut self.addons_view.input {
             input.push_str(clean);
         } else if self.screen == Screen::Search {
             self.search.query.push_str(clean);
@@ -1204,6 +1653,12 @@ impl App {
         if self.screen != screen {
             self.screen = screen;
             self.needs_clear = true;
+            if screen == Screen::Room && self.room.my_id.is_empty() {
+                match room::load_identity() {
+                    Ok(secret) => self.room.my_id = room::format_id(&secret.public()),
+                    Err(e) => self.room.status = Some((false, format!("{e:#}"))),
+                }
+            }
             if screen == Screen::Discover || screen == Screen::Search {
                 self.schedule_preview();
             }
@@ -1211,7 +1666,7 @@ impl App {
     }
 
     pub fn inserting(&self) -> bool {
-        self.screen == Screen::Search || (self.screen == Screen::Addons && self.addons_view.input.is_some())
+        self.screen == Screen::Search || (self.screen == Screen::Addons && self.addons_view.input.is_some()) || (self.screen == Screen::Room && self.room.input.is_some())
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -1226,6 +1681,7 @@ impl App {
         match self.screen {
             Screen::Search => return self.on_search_key(key),
             Screen::Addons if self.addons_view.input.is_some() => return self.on_install_key(key),
+            Screen::Room if self.room.input.is_some() => return self.on_room_input_key(key),
             _ => {}
         }
         // Screens that bind these keys themselves.
@@ -1237,6 +1693,7 @@ impl App {
                 '3' => return self.go(Screen::Library),
                 '4' => return self.go(Screen::Addons),
                 '5' => return self.go(Screen::Settings),
+                '6' => return self.go(Screen::Room),
                 '0' if self.playing.is_some() => return self.go(Screen::Playing),
                 '?' => {
                     self.overlay = Overlay::Help;
@@ -1259,6 +1716,7 @@ impl App {
             Screen::Playing => self.on_playing_key(key),
             Screen::Addons => self.on_addons_key(key),
             Screen::Settings => self.on_settings_key(key),
+            Screen::Room => self.on_room_key(key),
             Screen::Search => {}
         }
     }
@@ -1416,7 +1874,18 @@ impl App {
                     control.command(if id == 0 { json!(["set_property", property, "no"]) } else { json!(["set_property", property, id]) });
                 }
             }
+            Hit::Chapter(i) => {
+                if let Some(control) = self.playing.as_ref().and_then(|p| p.control.as_ref()) {
+                    control.command(json!(["set_property", "chapter", i]));
+                }
+            }
+            Hit::RoomGuest(i) => self.room.cursor = i,
             Hit::Seek => {
+                if let Some(duration) = self.playing.as_ref().map(|p| p.state.duration).filter(|d| *d > 0.0)
+                    && self.guest_control(Control::Seek { position: ratio * duration })
+                {
+                    return;
+                }
                 if let Some(p) = &self.playing
                     && let Some(control) = &p.control
                     && p.state.duration > 0.0
@@ -1503,6 +1972,7 @@ impl App {
                 self.discover.cursor = 0;
             }
             KeyCode::Char('G') => self.cycle_genre(),
+            KeyCode::Char('L') if self.current_catalog_is_youtube() => self.start_youtube_sign_in(),
             KeyCode::Char('Y') => self.cycle_year(),
             KeyCode::PageDown | KeyCode::Char('>') | KeyCode::Char('.') => self.move_cursor((cols * rows) as isize),
             KeyCode::PageUp | KeyCode::Char('<') | KeyCode::Char(',') => self.move_cursor(-((cols * rows) as isize)),
@@ -1792,6 +2262,21 @@ impl App {
             self.leave_playing();
             return;
         };
+        let as_guest = match key.code {
+            KeyCode::Char(' ') => Some(if p.state.paused { Control::Resume } else { Control::Pause }),
+            KeyCode::Left | KeyCode::Right => {
+                let step = if shift { 60.0 } else { 5.0 };
+                let target = p.state.position + if key.code == KeyCode::Left { -step } else { step };
+                Some(Control::Seek { position: target.max(0.0) })
+            }
+            _ => None,
+        };
+        if let Some(control) = as_guest
+            && self.guest_control(control)
+        {
+            return;
+        }
+        let Some(p) = &mut self.playing else { return };
         let Some(control) = p.control.clone() else {
             // Still connecting: only stop and leave work.
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
@@ -1818,6 +2303,7 @@ impl App {
                 p.log.push_back((clock(), "set aid".into(), "next".into()));
             }
             KeyCode::Char('c') => control.command(json!(["add", "chapter", 1])),
+            KeyCode::Char('i') => control.command(json!(["seek", 90])),
             KeyCode::Char('C') => control.command(json!(["add", "chapter", -1])),
             KeyCode::Char('z') => control.command(json!(["add", "sub-delay", -0.1])),
             KeyCode::Char('x') => control.command(json!(["add", "sub-delay", 0.1])),
@@ -2032,6 +2518,19 @@ impl App {
             8 => c.streams.timeout = (c.streams.timeout as i64 + delta(1)).clamp(2, 60) as u64,
             9 => c.subtitles.auto = !c.subtitles.auto,
             10 => c.player.high_quality = !c.player.high_quality,
+            12 => {
+                if self.youtube_signed_in {
+                    match youtube::sign_out() {
+                        Ok(()) => {
+                            self.youtube_signed_in = false;
+                            self.toast(true, "signed out of YouTube");
+                        }
+                        Err(e) => self.toast(false, format!("could not sign out: {e}")),
+                    }
+                } else {
+                    self.start_youtube_sign_in();
+                }
+            }
             11 => {
                 const SIZES: [u64; 4] = [10, 25, 50, 100];
                 let at = SIZES.iter().position(|s| *s == c.streams.max_size_gb).unwrap_or(1);

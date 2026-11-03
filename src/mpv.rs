@@ -103,6 +103,9 @@ impl PlayRequest {
             format!("--volume={}", self.volume),
             "--network-timeout=120".to_string(),
             "--cache=yes".to_string(),
+            // mpv's default cache is the bulk of its memory; torrents are on disk anyway.
+            "--demuxer-max-bytes=32M".to_string(),
+            "--demuxer-max-back-bytes=8M".to_string(),
         ];
         match &self.terminal_vo {
             Some(vo) => args.push(format!("--vo={vo}")),
@@ -160,7 +163,7 @@ impl Mpv {
         let socket = socket_path();
         let inherit = request.terminal_vo.is_some();
         let mut command = Command::new(bin);
-        command.args(request.args(&socket)).kill_on_drop(true);
+        command.args(request.args(&socket)).env("PATH", crate::youtube::child_path()).kill_on_drop(true);
         if !inherit {
             command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         }

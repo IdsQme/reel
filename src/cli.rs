@@ -105,6 +105,32 @@ pub async fn addon_set_enabled(query: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn show_id() -> Result<()> {
+    println!("{}", crate::room::format_id(&crate::room::load_identity()?.public()));
+    Ok(())
+}
+
+pub async fn youtube_login() -> Result<()> {
+    println!("  {SUB}Sign in to Google in the Firefox window, then close it.{RESET}");
+    if crate::youtube::sign_in().await? {
+        println!("  {GREEN}✓{RESET} {SUB}signed in to YouTube{RESET}");
+    } else {
+        println!("  {DIM}not signed in{RESET}");
+    }
+    Ok(())
+}
+
+pub fn youtube_logout() -> Result<()> {
+    crate::youtube::sign_out()?;
+    println!("  {GREEN}✓{RESET} {SUB}signed out of YouTube{RESET}");
+    Ok(())
+}
+
+pub fn youtube_status() -> Result<()> {
+    println!("  {SUB}{}{RESET}", if crate::youtube::signed_in() { "signed in" } else { "not signed in" });
+    Ok(())
+}
+
 pub async fn search(query: &str, kind: Option<&str>) -> Result<()> {
     let config = Config::load()?;
     let (client, addons) = load_addons(&config).await?;
@@ -278,6 +304,9 @@ pub async fn play(target: &str, quality: Option<&str>, sub: Option<&str>, kind: 
         request.target = target.to_string();
     }
 
+    if crate::youtube::is_youtube_url(&request.target) {
+        request.extra_args.extend(crate::youtube::mpv_args());
+    }
     println!("    {DIM}{} {}{RESET}", bin.display(), request.args(&mpv::socket_path()).iter().take(2).cloned().collect::<Vec<_>>().join(" "));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let inherit = request.terminal_vo.is_some();

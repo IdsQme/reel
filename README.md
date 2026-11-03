@@ -75,6 +75,26 @@ Press `?` in the app for the full list.
 | `S` `G` `Y` | Cycle sort, genre, year |
 | `q` | Quit, or stop on Now Playing |
 
+## YouTube
+
+The Catalogs panel has a YouTube section. Music, Gaming, News, Science, Tech and search need no account. They are topic searches, because YouTube's public pages list nothing without one. Signing in is optional and adds Home, Subscriptions, Watch later, Liked and History. Videos play in reel through mpv and `yt-dlp`, which fetch the video stream directly, so YouTube's player ads aren't part of it. Sponsor segments inside a video are not removed, unless the video's chapters mark them, in which case a Skip button appears.
+
+It needs `yt-dlp` and Deno (`winget install yt-dlp.yt-dlp DenoLand.Deno`), and Firefox if you want to sign in. Press `L` on a YouTube catalog, or run `reel youtube login`: Google's own sign-in page opens in a separate Firefox profile. Sign in there and close the window. reel never sees your password; `yt-dlp` reads the session from that profile, stored in `~/.config/reel/youtube-profile`. Anyone with access to that folder has your YouTube session. Sign out under Settings or with `reel youtube logout`, which deletes the folder. Using these tools may be against YouTube's terms of service, so your account is at your own risk.
+
+## Watch together
+
+Press `6` for rooms: synced playback with friends over an end-to-end encrypted peer-to-peer connection. There is no password.
+
+Every reel has a private key, kept in `~/.config/reel/identity.key`, and a public reel ID (`reel id`, or `y` on the Room screen). To invite someone, get their reel ID, press `n` then `i`, and paste it. Send them the invite that creates. They press `i` and paste it, and you both compare the four safety words before you approve them.
+
+- **A copied or guessed invite is useless.** It names one reel ID, and joining means proving you hold that ID's private key during the TLS 1.3 handshake. Anyone else is refused before receiving anything.
+- **Invites** work once, expire after 15 minutes, are signed by the host, and die with the room.
+- **Safety words** are derived from the session keys. If they match on a call, nobody swapped an ID or invite on the way.
+- **Peers aren't trusted.** Messages are size-limited and strictly validated, and can only name catalog content, never a URL, file or command. Local files are never shared. Guests are asked before each title starts, and find it with their own addons, so a host can't push a torrent or link onto them.
+- **No background network.** Nothing connects until you open or join a room.
+
+People in a room can see each other's IP address. Connections use iroh (QUIC). Its public relay and discovery servers help peers find each other and can relay traffic, which they can't read, but they can see that two IDs are connecting. Protect `identity.key`: anyone with that file can act as your reel ID. If it leaks, delete it and reel makes a new ID.
+
 ## Picture quality
 
 reel picks streams for you with `p`: it skips dead torrents and camrips (shown as a red `CAM`), then picks the largest file with a healthy swarm, up to `[streams] max_size_gb` (25 by default). Bigger files look better but need more bandwidth. mpv runs with its `high-quality` profile, which you can turn off under Settings as "Video quality".

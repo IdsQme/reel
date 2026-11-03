@@ -2,7 +2,7 @@
 //! Each file is exposed to mpv through a small local HTTP server with Range support.
 use crate::config::cache_dir;
 use anyhow::{Context, Result, anyhow};
-use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, api::TorrentIdOrHash};
+use librqbit::{AddTorrent, AddTorrentOptions, DhtSessionConfig, ManagedTorrent, Session, SessionOptions, api::TorrentIdOrHash};
 use std::collections::HashMap;
 use std::fs::File;
 use std::net::SocketAddr;
@@ -23,9 +23,10 @@ const DEFAULT_TRACKERS: [&str; 6] = [
 ];
 const VIDEO_EXTENSIONS: [&str; 8] = ["mkv", "mp4", "webm", "avi", "mov", "m4v", "ts", "wmv"];
 const METADATA_TIMEOUT: Duration = Duration::from_secs(90);
-/// Seconds mpv must have buffered before the download is paced, and the level that lifts it.
+/// Seconds mpv must have buffered before the download is paced. High-bitrate films may not
+/// fit that many in mpv's cache, so the target also shrinks to what the cache can hold.
 const PACE_ABOVE_SECONDS: f64 = 30.0;
-const UNPACE_BELOW_SECONDS: f64 = 10.0;
+const PACE_ABOVE_BYTES: f64 = 24.0 * 1_048_576.0;
 /// Paced speed as a multiple of the film's average bitrate, with a floor for swarm hiccups.
 const PACE_MULTIPLE: f64 = 2.0;
 const PACE_FLOOR_BPS: f64 = 1_048_576.0;
@@ -92,10 +93,10 @@ fn paced_bps(total_bytes: u64, duration: f64) -> u32 {
 }
 
 /// Whether to pace now. Between the two thresholds the current state holds, so it doesn't flap.
-fn should_pace(currently: bool, cache_seconds: f64, buffering: bool) -> bool {
-    if buffering || cache_seconds < UNPACE_BELOW_SECONDS {
+fn should_pace(currently: bool, cache_seconds: f64, buffering: bool, above_seconds: f64) -> bool {
+    if buffering || cache_seconds < above_seconds / 3.0 {
         false
-    } else if cache_seconds >= PACE_ABOVE_SECONDS {
+    } else if cache_seconds >= above_seconds {
         true
     } else {
         currently
@@ -147,7 +148,11 @@ impl Engine {
         #[cfg(windows)]
         exit_cleanup::register(folder.clone());
         let _ = tokio::task::spawn_blocking(sweep_stale).await;
-        let session = Session::new_with_opts(folder, SessionOptions { ..Default::default() }).await.context("starting torrent engine")?;
+        let session = Session::new_with_opts(folder, SessionOptions {
+                // A saved DHT port would stop a second reel from streaming at the same time.
+                dht: Some(DhtSessionConfig { persistence: None, ..Default::default() }),
+                ..Default::default()
+            }).await.context("starting torrent engine")?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
         let torrents: Arc<Mutex<HashMap<String, Handle>>> = Arc::default();
@@ -218,7 +223,11 @@ impl Engine {
         let limits = &self.session.ratelimits;
         let current = limits.get_download_bps();
         let wanted = match handle {
-            Some(handle) if duration > 0.0 && should_pace(current.is_some(), cache_seconds, buffering) => NonZeroU32::new(paced_bps(handle.stats().total_bytes, duration)),
+            Some(handle) if duration > 0.0 => {
+                let total = handle.stats().total_bytes;
+                let above = PACE_ABOVE_SECONDS.min(PACE_ABOVE_BYTES / (total as f64 / duration).max(1.0));
+                if should_pace(current.is_some(), cache_seconds, buffering, above) { NonZeroU32::new(paced_bps(total, duration)) } else { None }
+            }
             _ => None,
         };
         if wanted != current {
@@ -312,11 +321,13 @@ mod tests {
 
     #[test]
     fn pacing_engages_with_a_full_buffer_and_lifts_on_low_buffer_or_stall() {
-        assert!(should_pace(false, 30.0, false));
-        assert!(!should_pace(false, 20.0, false));
-        assert!(should_pace(true, 20.0, false));
-        assert!(!should_pace(true, 5.0, false));
-        assert!(!should_pace(true, 120.0, true));
+        assert!(should_pace(false, 30.0, false, 30.0));
+        assert!(!should_pace(false, 20.0, false, 30.0));
+        assert!(should_pace(true, 20.0, false, 30.0));
+        assert!(!should_pace(true, 5.0, false, 30.0));
+        assert!(!should_pace(true, 120.0, true, 30.0));
+        // A high-bitrate film whose cache only holds 12 s still gets paced.
+        assert!(should_pace(false, 12.0, false, 12.0));
     }
 
     #[test]

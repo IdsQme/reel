@@ -1,7 +1,7 @@
 //! Client for the Stremio addon protocol: manifest, catalog, meta, stream, subtitles.
 //! Responses are read leniently from JSON because community addons vary a lot.
-use crate::config::{AddonEntry, LOCAL_ADDON_URL, cache_dir};
-use crate::local;
+use crate::config::{AddonEntry, LOCAL_ADDON_URL, YOUTUBE_ADDON_URL, cache_dir};
+use crate::{local, youtube};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -340,8 +340,13 @@ pub struct Addon {
 }
 
 impl Addon {
+    /// Built into reel rather than reached over HTTP.
     pub fn is_local(&self) -> bool {
-        self.url == LOCAL_ADDON_URL
+        self.url == LOCAL_ADDON_URL || self.url == YOUTUBE_ADDON_URL
+    }
+
+    fn is_youtube(&self) -> bool {
+        self.url == YOUTUBE_ADDON_URL
     }
 
     fn base(&self) -> &str {
@@ -356,7 +361,7 @@ impl Addon {
 /// Accepts a manifest URL, a stremio:// link or an addon's /configure page.
 pub fn normalize_url(input: &str) -> Result<String> {
     let input = input.trim();
-    if input == LOCAL_ADDON_URL {
+    if input == LOCAL_ADDON_URL || input == YOUTUBE_ADDON_URL {
         return Ok(input.to_string());
     }
     let url = input.strip_prefix("stremio://").map(|rest| format!("https://{rest}")).unwrap_or_else(|| input.to_string());
@@ -421,6 +426,9 @@ impl Client {
         if entry.url == LOCAL_ADDON_URL {
             return Addon { url: entry.url.clone(), enabled: entry.enabled, manifest: local::manifest(), latency: Some(0), error: None };
         }
+        if entry.url == YOUTUBE_ADDON_URL {
+            return Addon { url: entry.url.clone(), enabled: entry.enabled, manifest: youtube::manifest(), latency: Some(0), error: None };
+        }
         let started = Instant::now();
         let result = async {
             let value = self.get_json(&entry.url).await?;
@@ -446,8 +454,12 @@ impl Client {
     }
 
     pub async fn catalog(&self, addon: &Addon, catalog: &CatalogDef, extra: &[(&str, String)]) -> Result<Vec<Meta>> {
+        let search = extra.iter().find(|(k, _)| *k == "search").map(|(_, v)| v.as_str());
+        if addon.is_youtube() {
+            let skip = extra.iter().find(|(k, _)| *k == "skip").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+            return youtube::catalog(&self.http, &catalog.id, search, skip).await;
+        }
         if addon.is_local() {
-            let search = extra.iter().find(|(k, _)| *k == "search").map(|(_, v)| v.as_str());
             return Ok(local::catalog(&catalog.id, search));
         }
         let mut url = format!("{}/catalog/{}/{}", addon.base(), catalog.kind, catalog.id);
@@ -481,6 +493,9 @@ impl Client {
     }
 
     pub async fn streams(&self, addon: &Addon, kind: &str, id: &str) -> Result<Vec<Stream>> {
+        if addon.is_youtube() {
+            return Ok(youtube::streams(id));
+        }
         if addon.is_local() {
             return Ok(local::streams(id));
         }
@@ -537,10 +552,12 @@ pub fn addons_from_cache(entries: &[AddonEntry]) -> Vec<Addon> {
         .map(|e| {
             let manifest = if e.url == LOCAL_ADDON_URL {
                 local::manifest()
+            } else if e.url == YOUTUBE_ADDON_URL {
+                youtube::manifest()
             } else {
                 cache.0.get(&e.url).cloned().unwrap_or_else(|| Manifest { name: e.url.clone(), ..Default::default() })
             };
-            Addon { url: e.url.clone(), enabled: e.enabled, manifest, latency: (e.url == LOCAL_ADDON_URL).then_some(0), error: None }
+            Addon { url: e.url.clone(), enabled: e.enabled, manifest, latency: (e.url == LOCAL_ADDON_URL || e.url == YOUTUBE_ADDON_URL).then_some(0), error: None }
         })
         .collect()
 }

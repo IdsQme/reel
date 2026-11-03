@@ -10,18 +10,25 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
 
 pub type PosterKey = (String, u16, u16);
 
+/// Encoded posters on screen plus a little history, and decoded images waiting to be encoded.
+/// Anything evicted comes back from the disk cache when needed.
+pub const MAX_RENDERED: usize = 40;
+/// Decoded images never need to be larger than this to fill a poster frame.
+const MAX_DECODED_SIZE: (u32, u32) = (480, 720);
+
 pub struct Posters {
     picker: Picker,
     enabled: bool,
     raw: HashMap<String, Option<Arc<DynamicImage>>>,
     rendered: HashMap<PosterKey, Protocol>,
+    rendered_order: VecDeque<PosterKey>,
     pending: HashSet<PosterKey>,
     fetching: HashSet<String>,
     wants: RefCell<Vec<PosterKey>>,
@@ -42,11 +49,13 @@ impl Posters {
             enabled: true,
             raw: HashMap::new(),
             rendered: HashMap::new(),
+            rendered_order: VecDeque::new(),
             pending: HashSet::new(),
             fetching: HashSet::new(),
             wants: RefCell::new(Vec::new()),
-            downloads: Arc::new(Semaphore::new(6)),
-            encodes: Arc::new(Semaphore::new(4)),
+            // One HTTP/2 connection carries these, so many at once costs little.
+            downloads: Arc::new(Semaphore::new(16)),
+            encodes: Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get().min(8)))),
         };
         posters.set_mode(mode);
         posters
@@ -61,6 +70,7 @@ impl Posters {
             _ => {}
         }
         self.rendered.clear();
+        self.rendered_order.clear();
         self.pending.clear();
     }
 
@@ -150,11 +160,19 @@ impl Posters {
 
     pub fn on_encoded(&mut self, key: PosterKey, protocol: Option<Protocol>) {
         self.pending.remove(&key);
+        // The decoded image is by far the largest part. If this poster is ever needed
+        // again, the disk cache brings it back in milliseconds.
+        if !self.pending.iter().any(|other| other.0 == key.0) {
+            self.raw.remove(&key.0);
+        }
         if let Some(protocol) = protocol {
-            if self.rendered.len() > 120 {
-                self.rendered.clear();
-            }
+            self.rendered_order.push_back(key.clone());
             self.rendered.insert(key, protocol);
+            while self.rendered_order.len() > MAX_RENDERED {
+                if let Some(oldest) = self.rendered_order.pop_front() {
+                    self.rendered.remove(&oldest);
+                }
+            }
         }
     }
 }
@@ -173,5 +191,12 @@ async fn download(http: &reqwest::Client, url: &str) -> Option<DynamicImage> {
             bytes
         }
     };
-    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes).ok()).await.ok().flatten()
+    tokio::task::spawn_blocking(move || {
+        let image = image::load_from_memory(&bytes).ok()?;
+        let (w, h) = MAX_DECODED_SIZE;
+        Some(if image.width() > w || image.height() > h { image.resize(w, h, FilterType::Triangle) } else { image })
+    })
+    .await
+    .ok()
+    .flatten()
 }

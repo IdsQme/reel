@@ -14,8 +14,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui_image::picker::Picker;
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+const MIN_FRAME_TIME: Duration = Duration::from_millis(33);
 
 fn restore() {
     crate::embed::hide_console_stub();
@@ -100,6 +102,7 @@ pub async fn run() -> Result<()> {
 
     let result: Result<()> = async {
         terminal.draw(|f| draw::draw(f, &app))?;
+        let mut last_frame = Instant::now();
         while let Some(event) = rx.recv().await {
             app.handle(event);
             // Coalesce bursts (posters arriving, key repeat) into one frame.
@@ -109,10 +112,25 @@ pub async fn run() -> Result<()> {
             if app.should_quit {
                 break;
             }
+            if !app.dirty && !app.needs_clear {
+                continue;
+            }
+            let since_last = last_frame.elapsed();
+            if since_last < MIN_FRAME_TIME {
+                tokio::time::sleep(MIN_FRAME_TIME - since_last).await;
+                while let Ok(event) = rx.try_recv() {
+                    app.handle(event);
+                }
+                if app.should_quit {
+                    break;
+                }
+            }
             if std::mem::take(&mut app.needs_clear) {
                 terminal.clear()?;
             }
+            app.dirty = false;
             terminal.draw(|f| draw::draw(f, &app))?;
+            last_frame = Instant::now();
             app.after_draw();
         }
         Ok(())

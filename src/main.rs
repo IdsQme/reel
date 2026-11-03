@@ -4,10 +4,12 @@ mod config;
 mod embed;
 mod local;
 mod mpv;
+mod room;
 mod streams;
 mod theme;
 mod torrent;
 mod tui;
+mod youtube;
 
 use clap::{Parser, Subcommand};
 
@@ -25,6 +27,13 @@ enum Command {
         #[command(subcommand)]
         action: AddonAction,
     },
+    /// Sign in to YouTube with your Google account, or sign out
+    Youtube {
+        #[command(subcommand)]
+        action: YoutubeAction,
+    },
+    /// Show your reel ID, which a host needs to invite you to a room
+    Id,
     /// Search all addon catalogs
     Search {
         query: Vec<String>,
@@ -53,6 +62,16 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum YoutubeAction {
+    /// Open Google's sign-in page in a dedicated Firefox profile
+    Login,
+    /// Delete that profile and its session
+    Logout,
+    /// Show whether you are signed in
+    Status,
+}
+
+#[derive(Subcommand)]
 enum AddonAction {
     /// Install from a manifest URL, stremio:// link or /configure page
     Install { url: String },
@@ -66,8 +85,19 @@ enum AddonAction {
     Disable { addon: String },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Every thread costs memory: a few workers are plenty, and poster encoding's extra
+    // threads go away soon after use.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(3)
+        .max_blocking_threads(8)
+        .thread_keep_alive(std::time::Duration::from_secs(2))
+        .enable_all()
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let result = match args.command {
         None => tui::run().await,
@@ -78,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
             AddonAction::Enable { addon } => cli::addon_set_enabled(&addon, true).await,
             AddonAction::Disable { addon } => cli::addon_set_enabled(&addon, false).await,
         },
+        Some(Command::Youtube { action }) => match action {
+            YoutubeAction::Login => cli::youtube_login().await,
+            YoutubeAction::Logout => cli::youtube_logout(),
+            YoutubeAction::Status => cli::youtube_status(),
+        },
+        Some(Command::Id) => cli::show_id(),
         Some(Command::Search { query, kind }) => cli::search(&query.join(" "), kind.as_deref()).await,
         Some(Command::Streams { id, kind }) => cli::streams(&id, kind.as_deref()).await,
         Some(Command::Play { target, quality, sub, kind, output }) => cli::play(&target, quality.as_deref(), sub.as_deref(), kind.as_deref(), output.as_deref()).await,

@@ -3,6 +3,7 @@ use super::app::*;
 use crate::addon::{self, Meta};
 use crossterm::event::KeyCode;
 use crate::mpv::{self, format_time};
+use crate::room;
 use crate::streams;
 use crate::theme::*;
 use ratatui::Frame;
@@ -129,6 +130,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Library => draw_library(f, app, body),
         Screen::Addons => draw_addons(f, app, body),
         Screen::Settings => draw_settings(f, app, body),
+        Screen::Room => draw_room(f, app, body),
         Screen::Details => draw_details(f, app, body),
         Screen::Playing => draw_playing(f, app, body),
     }
@@ -148,12 +150,13 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let accent = app.accent();
-    let tabs: [(&str, &str, bool); 5] = [
+    let tabs: [(&str, &str, bool); 6] = [
         ("1", "Discover", matches!(app.screen, Screen::Discover | Screen::Details)),
         ("2", "Search", app.screen == Screen::Search),
         ("3", "Library", app.screen == Screen::Library),
         ("4", "Addons", app.screen == Screen::Addons),
         ("5", "Settings", app.screen == Screen::Settings),
+        ("6", "Room", app.screen == Screen::Room),
     ];
     let mut spans = vec![Span::styled(" ▶ reel ", Style::new().bg(accent).fg(CRUST).add_modifier(Modifier::BOLD)), Span::raw("  ")];
     let mut push_tab = |key: &str, name: &str, active: bool| {
@@ -170,7 +173,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         push_tab("0", "Playing", app.screen == Screen::Playing);
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-    let targets = [Screen::Discover, Screen::Search, Screen::Library, Screen::Addons, Screen::Settings];
+    let targets = [Screen::Discover, Screen::Search, Screen::Library, Screen::Addons, Screen::Settings, Screen::Room];
     let mut x = area.x + 10;
     for ((_, name, _), target) in tabs.iter().zip(targets) {
         let width = name.width() as u16 + 4;
@@ -188,6 +191,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         (None, _) => Line::from(vec![s("● ", GREEN), s("mpv ready", OVERLAY2)]),
     };
     let mut right = mpv_state.spans;
+    if app.in_room() {
+        right.push(s("   ● ", GREEN));
+        let people = if app.room.host.is_some() { app.room.guests.iter().filter(|g| g.joined).count() + 1 } else { 2 };
+        right.push(s(if app.room.host.is_none() { "in room".to_string() } else { format!("room {people}") }, OVERLAY2));
+    }
     right.push(s(format!("   {} addons", app.enabled_addons()), OVERLAY2));
     f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), area);
 }
@@ -228,6 +236,7 @@ fn crumb(app: &App) -> String {
         Screen::Library => "Library".to_string(),
         Screen::Addons => format!("Addons › {}", app.addons.get(app.addons_view.cursor).map(|a| a.manifest.name.as_str()).unwrap_or("")),
         Screen::Settings => "Settings".to_string(),
+        Screen::Room => "Room".to_string(),
         Screen::Details => {
             let d = app.details.as_ref();
             let back = match d.map(|d| d.back) {
@@ -257,7 +266,8 @@ fn status_right<'a>(app: &App) -> Vec<Span<'a>> {
             if app.discover.loading {
                 parts.push(s("… loading", YELLOW));
             } else if app.discover.error.is_some() {
-                parts.push(s("✗ catalog failed", RED));
+                let optional_sign_in = app.discover.error.as_deref().is_some_and(|e| e.contains("Press L"));
+                parts.push(if optional_sign_in { s("L sign in", OVERLAY2) } else { s("✗ catalog failed", RED) });
             } else if let Some(ms) = app.discover.ms {
                 parts.push(s("✓ ", GREEN));
                 parts.push(s(format!("catalog {ms} ms"), OVERLAY2));
@@ -280,6 +290,7 @@ fn status_right<'a>(app: &App) -> Vec<Span<'a>> {
             parts.push(s("~/.config/reel/addons.toml", OVERLAY2));
         }
         Screen::Settings => parts.push(s("~/.config/reel/config.toml", OVERLAY2)),
+        Screen::Room => parts.push(s(if app.in_room() { "✓ encrypted, peer to peer" } else { "no network until you open or join a room" }, OVERLAY2)),
         Screen::Details => {
             if let Some(set) = app.current_streams() {
                 let cursor = app.details.as_ref().map(|d| d.stream_cursor + 1).unwrap_or(0);
@@ -326,6 +337,10 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         Screen::Settings => (vec![("j/k", "select"), ("h/l", "change"), ("e", "edit file")], ("esc", "back")),
+        Screen::Room if app.room.input.is_some() => (vec![("⏎", "confirm"), ("ctrl-u", "clear")], ("esc", "cancel")),
+        Screen::Room if app.room.host.is_some() => (vec![("i", "invite"), ("y", "copy invite"), ("j/k", "select"), ("⏎", "approve"), ("d", "deny or remove"), ("l", "close room")], ("esc", "back")),
+        Screen::Room if app.room.guest.is_some() => (vec![("⏎", "watch"), ("y", "copy my ID"), ("l", "leave room")], ("esc", "back")),
+        Screen::Room => (vec![("n", "new room"), ("i", "join with invite"), ("y", "copy my ID")], ("esc", "back")),
         Screen::Details => {
             let series = app.details.as_ref().is_some_and(|d| d.meta.is_series());
             let mut keys: Vec<(&str, &str)> = if series { vec![("tab", "panel"), ("h/l", "season")] } else { vec![] };
@@ -474,7 +489,12 @@ fn draw_discover(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(pager).alignment(Alignment::Right), toolbar);
 
     if let Some(error) = &d.error {
-        f.render_widget(Paragraph::new(s(error.clone(), RED)).wrap(Wrap { trim: true }), grid);
+        // Signing in is optional, so that message isn't shown as an error.
+        let optional_sign_in = error.contains("Press L");
+        f.render_widget(Paragraph::new(s(error.clone(), if optional_sign_in { SUBTEXT1 } else { RED })).wrap(Wrap { trim: true }), grid);
+        if optional_sign_in {
+            hit(app, grid, Hit::Key(KeyCode::Char('L')));
+        }
     } else if visible.is_empty() {
         let message = if d.loading { "Loading catalog…" } else { "Nothing here yet" };
         f.render_widget(Paragraph::new(s(message, OVERLAY2)), grid);
@@ -547,6 +567,7 @@ fn draw_grid(f: &mut Frame, app: &App, grid: Rect, items: &[&Meta], cols: usize,
     let card_h = (grid.height + 1) / rows as u16;
     let inner_h = card_h.saturating_sub(5);
     let poster_w = (poster_width(app, inner_h) + 2).min(cell_w);
+    app.poster_size.set((poster_w.saturating_sub(2), inner_h));
     for (i, meta) in items.iter().enumerate() {
         let (cx, cy) = ((i % cols) as u16, (i / cols) as u16);
         let x = grid.x + cx * (cell_w + 2);
@@ -885,7 +906,7 @@ fn draw_playing(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let ipc_h = if p.embedded { 5 } else { 7 };
-    let [now, panels, ipc] = Layout::vertical([Constraint::Length(7), Constraint::Min(0), Constraint::Length(ipc_h)]).areas(area);
+    let [ipc, panels, now] = Layout::vertical([Constraint::Length(ipc_h), Constraint::Min(0), Constraint::Length(7)]).areas(area);
 
     let output = if p.embedded {
         "in reel"
@@ -927,6 +948,7 @@ fn draw_playing(f: &mut Frame, app: &App, area: Rect) {
         let width = next.saturating_sub(x);
         let style = if current { bold(accent) } else { fg(OVERLAY2) };
         let text = format!("│{}", fit(&label, width.saturating_sub(2) as usize));
+        hit(app, Rect::new(x, y, width, 1), Hit::Chapter(i));
         line_at(buf, x, y, width, &Line::from(Span::styled(text, style)));
     }
 
@@ -1005,6 +1027,26 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
     hit(app, Rect::new(area.x + 10, y, bar_w, 1), Hit::Seek);
 }
 
+/// Names the part of a video that people usually skip, from its chapter title.
+fn skip_label(title: &str) -> Option<&'static str> {
+    let lower = title.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(w));
+    if has(&["intro", "opening", "op", "oped"]) {
+        Some("Intro")
+    } else if has(&["recap", "previously"]) {
+        Some("Recap")
+    } else if has(&["sponsor", "ad", "ads", "advertisement"]) {
+        Some("Ad")
+    } else if has(&["credits", "ending", "outro", "ed"]) {
+        Some("Credits")
+    } else if has(&["preview"]) {
+        Some("Preview")
+    } else {
+        None
+    }
+}
+
 /// The clickable transport buttons, volume bar and toggles.
 fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
     let Some(p) = &app.playing else { return };
@@ -1021,20 +1063,25 @@ fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
         (" ▶▶ ".to_string(), Some(KeyCode::Right), fg(TEXT).bg(SURFACE0)),
         (" ▶| ".to_string(), char_key('c'), fg(TEXT).bg(SURFACE0)),
         (" Next ".to_string(), char_key('n'), fg(TEXT).bg(SURFACE0)),
+        (" ■ Stop ".to_string(), char_key('q'), fg(RED).bg(SURFACE0)),
         (" − ".to_string(), char_key('['), fg(TEXT).bg(SURFACE0)),
         (format!(" {:.2}× ", st.speed), Some(KeyCode::Char('\\')), fg(TEXT).bg(MANTLE)),
         (" + ".to_string(), char_key(']'), fg(TEXT).bg(SURFACE0)),
         (" Subs ".to_string(), char_key('s'), fg(TEXT).bg(SURFACE0)),
         (" Audio ".to_string(), char_key('a'), fg(TEXT).bg(SURFACE0)),
-        (loop_label.to_string(), char_key('l'), fg(TEXT).bg(SURFACE0)),
-        (view.to_string(), char_key('t'), fg(TEXT).bg(SURFACE0)),
         (" ▢ Fullscreen ".to_string(), char_key('f'), fg(TEXT).bg(SURFACE0)),
-        (" ■ Stop ".to_string(), char_key('q'), fg(RED).bg(SURFACE0)),
+        (view.to_string(), char_key('t'), fg(TEXT).bg(SURFACE0)),
+        (loop_label.to_string(), char_key('l'), fg(TEXT).bg(SURFACE0)),
     ];
     if !p.embedded {
         left.retain(|(_, code, _)| *code != char_key('t'));
     }
-    let volume_w = 20u16;
+    left.insert(5, (" +90s ".to_string(), char_key('i'), fg(TEXT).bg(SURFACE0)));
+    let chapter = usize::try_from(st.chapter).ok().and_then(|c| st.chapters.get(c));
+    if let Some(label) = chapter.and_then(|c| skip_label(&c.title)) {
+        left.insert(0, (format!(" ▶▶ Skip {label} "), char_key('c'), bold(CRUST).bg(GREEN)));
+    }
+    let volume_w = 12u16;
     let mut x = area.x;
     let limit = area.right().saturating_sub(volume_w + 12);
     for (label, code, style) in left {
@@ -1557,6 +1604,126 @@ fn draw_addons(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_room(f: &mut Frame, app: &App, area: Rect) {
+    let accent = app.accent();
+    let room = &app.room;
+    let [top, bottom] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+
+    let inner = pad(panel(f, top, "Your reel ID", "safe to share", false, accent), 1);
+    let buf = f.buffer_mut();
+    line_at(buf, inner.x, inner.y, inner.width, &Line::from(s(fit(&room.my_id, inner.width as usize), BLUE)));
+    line_at(buf, inner.x, inner.y + 1, inner.width, &Line::from(s("Send this to whoever is hosting. Only this PC holds the private key behind it.", OVERLAY2)));
+    let input_y = inner.y + 2;
+    match &room.input {
+        Some((kind, text)) => {
+            fill(buf, row(inner, input_y), MANTLE);
+            let label = if *kind == RoomInput::Invite { "invite  " } else { "their reel ID  " };
+            let width = inner.width.saturating_sub(20) as usize;
+            let excess = text.chars().count().saturating_sub(width);
+            let shown: String = text.chars().skip(excess).collect();
+            let line = Line::from(vec![b("› ", PEACH).bg(MANTLE), s(label, OVERLAY2).bg(MANTLE), s(shown, TEXT).bg(MANTLE), Span::styled(" ", Style::new().bg(ROSEWATER))]);
+            line_at(buf, inner.x, input_y, inner.width, &line);
+        }
+        None => {
+            if let Some((ok, message)) = &room.status {
+                line_at(buf, inner.x, input_y, inner.width, &Line::from(vec![s(if *ok { "✓ " } else { "✗ " }, if *ok { GREEN } else { RED }), s(fit(message, inner.width.saturating_sub(2) as usize), if *ok { SUBTEXT1 } else { RED })]));
+            }
+        }
+    }
+
+    let button = |f: &mut Frame, x: &mut u16, y: u16, key: &str, label: &str, code: KeyCode| {
+        let text = format!(" {key} {label} ");
+        let width = text.width() as u16;
+        line_at(f.buffer_mut(), *x, y, width, &Line::from(Span::styled(text, fg(TEXT).bg(SURFACE0))));
+        hit(app, Rect::new(*x, y, width, 1), Hit::Key(code));
+        *x += width + 1;
+    };
+    let mut x = inner.x;
+    let buttons_y = inner.y + 3;
+    hit(app, row(inner, inner.y), Hit::Key(KeyCode::Char('y')));
+
+    if let Some(_host) = &room.host {
+        button(f, &mut x, buttons_y, "i", "Invite someone", KeyCode::Char('i'));
+        button(f, &mut x, buttons_y, "y", "Copy invite", KeyCode::Char('y'));
+        button(f, &mut x, buttons_y, "l", "Close room", KeyCode::Char('l'));
+        let [people, help] = Layout::horizontal([Constraint::Min(0), Constraint::Length((area.width * 2 / 5).clamp(36, 60))]).spacing(1).areas(bottom);
+        let joined = room.guests.iter().filter(|g| g.joined).count();
+        let inner = pad(panel(f, people, "Room", &format!("you + {joined} of 8 guests"), true, accent), 1);
+        if room.guests.is_empty() {
+            line_at(f.buffer_mut(), inner.x, inner.y, inner.width, &Line::from(s("Nobody here yet. Press i and paste a friend's reel ID.", OVERLAY2)));
+        }
+        for (i, guest) in room.guests.iter().enumerate() {
+            let y = inner.y + i as u16 * 2;
+            if y + 1 >= inner.bottom() {
+                break;
+            }
+            let selected = i == room.cursor;
+            hit(app, Rect::new(inner.x, y, inner.width, 2), Hit::RoomGuest(i));
+            let buf = f.buffer_mut();
+            if selected {
+                fill(buf, Rect::new(inner.x, y, inner.width, 2), SURFACE0);
+            }
+            let (state, color) = if guest.joined { ("in room", GREEN) } else { ("waiting: compare words, then ⏎", YELLOW) };
+            line_at(buf, inner.x, y, inner.width, &Line::from(vec![if selected { b("▸ ", accent) } else { s("  ", TEXT) }, s(room::short_id(&guest.id), BLUE), s("  ", TEXT), s(state, color)]));
+            line_at(buf, inner.x + 2, y + 1, inner.width.saturating_sub(2), &Line::from(vec![s("safety words  ", OVERLAY2), b(guest.words.clone(), ROSEWATER)]));
+        }
+        let inner = pad(panel(f, help, "Invite", "", false, accent), 1);
+        let mut lines = vec![
+            Line::from(s("1. Get your friend's reel ID.", SUBTEXT1)),
+            Line::from(s("2. Press i and paste it. The invite is copied.", SUBTEXT1)),
+            Line::from(s("3. Send them the invite.", SUBTEXT1)),
+            Line::from(s("4. When they connect, compare the safety words on a call, then approve.", SUBTEXT1)),
+            Line::raw(""),
+            Line::from(s("An invite works for that reel ID only, once, for 15 minutes. If someone else gets it, they still can't join.", OVERLAY2)),
+            Line::raw(""),
+            Line::from(s("Press play on anything: guests are asked before it starts on their side. Guests can see your IP address.", OVERLAY2)),
+        ];
+        if let Some(code) = &room.invite_code {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(s(code.clone(), BLUE)));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    } else if room.guest.is_some() {
+        button(f, &mut x, buttons_y, "l", "Leave room", KeyCode::Char('l'));
+        let inner = pad(panel(f, bottom, "Room", if room.admitted { "connected" } else { "waiting" }, true, accent), 1);
+        let mut lines = Vec::new();
+        match &room.words {
+            Some(words) => {
+                lines.push(Line::from(vec![s("safety words  ", OVERLAY2), b(words.clone(), ROSEWATER)]));
+                lines.push(Line::from(s("The host should see the same four words. If they differ, leave the room: someone is interfering.", OVERLAY2)));
+            }
+            None => lines.push(Line::from(s("Reaching the host…", OVERLAY2))),
+        }
+        lines.push(Line::raw(""));
+        match &room.offer {
+            Some(offer) => {
+                lines.push(Line::from(vec![s("The host wants to watch  ", OVERLAY2), b(offer.title.clone(), TEXT)]));
+                lines.push(Line::from(vec![b("⏎", PEACH), s(" find it with your own addons and play it in sync", SUBTEXT1)]));
+                hit(app, Rect::new(inner.x, inner.y + lines.len() as u16 - 1, inner.width, 1), Hit::Key(KeyCode::Enter));
+            }
+            None if room.admitted => lines.push(Line::from(s("Nothing playing yet. You'll be asked before anything starts.", SUBTEXT1))),
+            None => lines.push(Line::from(s("Waiting for the host to let you in.", SUBTEXT1))),
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    } else {
+        button(f, &mut x, buttons_y, "n", "New room", KeyCode::Char('n'));
+        button(f, &mut x, buttons_y, "i", "Join with invite", KeyCode::Char('i'));
+        button(f, &mut x, buttons_y, "y", "Copy my ID", KeyCode::Char('y'));
+        let inner = pad(panel(f, bottom, "Watch together", "encrypted, peer to peer", true, accent), 1);
+        let lines = vec![
+            Line::from(s("Watch in sync with friends. There is no password to guess or steal.", TEXT)),
+            Line::raw(""),
+            Line::from(vec![b("To join   ", LAVENDER), s("Send the host your reel ID. They send back an invite made for you. Press i and paste it.", SUBTEXT1)]),
+            Line::from(vec![b("To host   ", LAVENDER), s("Press n, then i, and paste your friend's reel ID. Send them the invite it creates.", SUBTEXT1)]),
+            Line::raw(""),
+            Line::from(vec![b("Why it's safe   ", LAVENDER), s("Joining needs the private key that only your friend's PC holds, so a copied or guessed invite is useless. Invites work once and expire. Before anyone gets in, both of you compare safety words.", OVERLAY2)]),
+            Line::raw(""),
+            Line::from(vec![b("Privacy   ", LAVENDER), s("People in a room can see each other's IP address. Traffic may pass through public relay servers, which can't read it. Nothing connects until you open or join a room.", OVERLAY2)]),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    }
+}
+
 fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let accent = app.accent();
     let c = &app.config;
@@ -1576,6 +1743,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         on_off(c.subtitles.auto),
         if c.player.high_quality { "high".to_string() } else { "standard".to_string() },
         format!("{} GB", c.streams.max_size_gb),
+        if app.youtube_signed_in { "signed in".to_string() } else { "not signed in".to_string() },
     ];
     for (i, (label, value)) in SETTINGS.iter().zip(values).enumerate() {
         let y = inner.y + i as u16;
@@ -1611,12 +1779,12 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered(area, 80, 24);
+    let popup = centered(area, 80, 25);
     f.render_widget(Clear, popup);
     let inner = pad(panel(f, popup, "Keys", "any key closes", true, app.accent()), 1);
     let entry = |key: &str, what: &str| Line::from(vec![b(format!("{key:<12}"), PEACH), s(what.to_string(), SUBTEXT1)]);
     let lines = vec![
-        entry("1 2 3 4 5", "Discover, Search, Library, Addons, Settings"),
+        entry("1 - 6", "Discover, Search, Library, Addons, Settings, Room"),
         entry("0", "back to Now Playing"),
         entry("/  a", "jump to Search, Addons"),
         entry("hjkl ↑↓←→", "move"),
@@ -1632,6 +1800,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         entry("←/→  ⇧←/→", "seek 5 s, 60 s"),
         entry("[ ] \\", "slower, faster, reset speed"),
         entry("s a c n", "next subtitle, audio, chapter, title"),
+        entry("C  i", "previous chapter, skip ahead 90 s"),
         entry("z x  Z X", "subtitle delay, subtitle size"),
         entry("l A", "loop, autoplay next"),
         entry("f F11  t", "fullscreen (esc leaves), theater"),
@@ -1999,10 +2168,136 @@ mod tests {
         assert!(!frame.contains("No streams found"), "{frame}");
     }
 
+    #[test]
+    fn recognises_skippable_chapters() {
+        assert_eq!(skip_label("Opening"), Some("Intro"));
+        assert_eq!(skip_label("OP"), Some("Intro"));
+        assert_eq!(skip_label("End Credits"), Some("Credits"));
+        assert_eq!(skip_label("Sponsor segment"), Some("Ad"));
+        assert_eq!(skip_label("Part A"), None);
+        assert_eq!(skip_label("Operation Overlord"), None);
+    }
+
+    #[tokio::test]
+    async fn now_playing_sits_below_the_video_with_clickable_chapters() {
+        let mut app = app();
+        app.screen = Screen::Playing;
+        let state = PlayerState {
+            duration: 1000.0,
+            chapter: 0,
+            chapters: vec![Chapter { title: "Opening".into(), time: 0.0 }, Chapter { title: "Part A".into(), time: 90.0 }],
+            ..Default::default()
+        };
+        app.playing = Some(Playing {
+            session: 1,
+            meta: sample_meta("tt0013442", "Nosferatu", "1922", "Horror"),
+            video_id: "tt0013442".into(),
+            title: "Nosferatu (1922)".into(),
+            quality: "1080p".into(),
+            release: "Restored".into(),
+            addon: "Torrentio".into(),
+            hash: None,
+            phase: Phase::Playing,
+            state,
+            control: None,
+            log: VecDeque::new(),
+            torrent: None,
+            last_saved: Instant::now(),
+            eof: false,
+            up_next: Vec::new(),
+            fullscreen: false,
+            embedded: true,
+            theater: false,
+            video_fullscreen: false,
+            mpv_fullscreen: None,
+        });
+        let frame = render(&app, 152, 38);
+        let at = |needle: &str| frame.find(needle).unwrap_or_else(|| panic!("missing {needle:?} in\n{frame}"));
+        assert!(at("mpv · IPC") < at("Video"));
+        assert!(at("Video") < at("Now playing"));
+        assert!(frame.contains("Skip Intro"), "{frame}");
+        assert!(frame.contains("+90s"), "{frame}");
+        assert!(app.hits.borrow().iter().any(|(_, h)| *h == Hit::Chapter(1)));
+    }
+
+    #[tokio::test]
+    async fn unchanged_seconds_do_not_trigger_a_redraw() {
+        let mut app = app();
+        app.screen = Screen::Playing;
+        app.playing = Some(Playing {
+            session: 1,
+            meta: sample_meta("tt0013442", "Nosferatu", "1922", "Horror"),
+            video_id: "tt0013442".into(),
+            title: "t".into(),
+            quality: "1080p".into(),
+            release: "r".into(),
+            addon: "a".into(),
+            hash: None,
+            phase: Phase::Playing,
+            state: PlayerState::default(),
+            control: None,
+            log: VecDeque::new(),
+            torrent: None,
+            last_saved: Instant::now(),
+            eof: false,
+            up_next: Vec::new(),
+            fullscreen: false,
+            embedded: true,
+            theater: false,
+            video_fullscreen: false,
+            mpv_fullscreen: None,
+        });
+        let position = |seconds: f64| Ev::Mpv(1, crate::mpv::MpvEvent::Property("time-pos".into(), serde_json::json!(seconds)));
+        app.dirty = false;
+        app.handle(position(10.1));
+        assert!(app.dirty, "first second should draw");
+        app.dirty = false;
+        app.handle(position(10.5));
+        assert!(!app.dirty, "same second must not redraw");
+        app.handle(position(11.0));
+        assert!(app.dirty, "next second should draw");
+    }
+
+    #[tokio::test]
+    async fn room_screen_explains_itself_and_starts_no_network() {
+        let mut app = app();
+        app.room.my_id = "reel-id-abc".into();
+        app.screen = Screen::Room;
+        let frame = render(&app, 152, 38);
+        for expected in ["6 Room", "Your reel ID", "reel-id-abc", "New room", "Join with invite", "no password", "safety words", "no network until"] {
+            assert!(frame.contains(expected), "missing {expected:?} in\n{frame}");
+        }
+        assert!(!app.in_room());
+        // Typing a key while pasting goes to the field, not the screen's shortcuts.
+        app.handle(Ev::Key(crossterm::event::KeyEvent::new(KeyCode::Char('i'), crossterm::event::KeyModifiers::NONE)));
+        assert!(app.room.input.is_some());
+        app.handle(Ev::Key(crossterm::event::KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE)));
+        assert_eq!(app.room.input.as_ref().unwrap().1, "n");
+        assert!(!app.room.starting, "n typed into the field must not open a room");
+        // A bad invite fails safely, without starting anything that lasts.
+        app.handle(Ev::Paste("not-an-invite".into()));
+        render(&app, 80, 24);
+    }
+
+    #[tokio::test]
+    async fn offered_content_never_starts_without_the_guest_saying_yes() {
+        let mut app = app();
+        app.handle(Ev::Room(crate::room::RoomEvent::Load(crate::room::LoadOffer {
+            meta_id: "tt0063350".into(),
+            video_id: "tt0063350".into(),
+            kind: "movie".into(),
+            title: "Night".into(),
+            hash: Some("a".repeat(40)),
+        })));
+        assert!(app.room.offer.is_some());
+        assert!(app.playing.is_none());
+        assert!(app.pending_play.is_none());
+    }
+
     #[tokio::test]
     async fn every_screen_survives_small_and_odd_sizes() {
         let mut app = details_app();
-        let screens = [Screen::Discover, Screen::Search, Screen::Library, Screen::Addons, Screen::Settings, Screen::Details];
+        let screens = [Screen::Discover, Screen::Search, Screen::Library, Screen::Addons, Screen::Settings, Screen::Room, Screen::Details];
         for (w, h) in [(60, 16), (80, 24), (100, 30), (152, 38), (237, 62), (40, 10)] {
             for screen in screens {
                 app.screen = screen;

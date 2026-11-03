@@ -7,11 +7,13 @@ use std::fs;
 use std::path::PathBuf;
 
 pub const LOCAL_ADDON_URL: &str = "local";
-pub const DEFAULT_ADDONS: [&str; 4] = [
+pub const YOUTUBE_ADDON_URL: &str = "youtube";
+pub const DEFAULT_ADDONS: [&str; 5] = [
     "https://v3-cinemeta.strem.io/manifest.json",
     "https://torrentio.strem.fun/manifest.json",
     "https://opensubtitles-v3.strem.io/manifest.json",
     LOCAL_ADDON_URL,
+    YOUTUBE_ADDON_URL,
 ];
 
 pub fn config_dir() -> PathBuf {
@@ -78,6 +80,19 @@ pub struct Local {
     pub dirs: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Youtube {
+    /// Highest video height to play.
+    pub max_height: u32,
+}
+
+impl Default for Youtube {
+    fn default() -> Self {
+        Self { max_height: 1080 }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -87,6 +102,7 @@ pub struct Config {
     pub subtitles: Subtitles,
     pub keys: Keys,
     pub local: Local,
+    pub youtube: Youtube,
 }
 
 impl Default for Ui {
@@ -170,7 +186,15 @@ pub fn addons_path() -> PathBuf {
 
 pub fn load_addons() -> Result<Vec<AddonEntry>> {
     match fs::read_to_string(addons_path()) {
-        Ok(text) => Ok(toml::from_str::<AddonsFile>(&text).context("parsing addons.toml")?.addon),
+        Ok(text) => {
+            let mut entries = toml::from_str::<AddonsFile>(&text).context("parsing addons.toml")?.addon;
+            // Lists saved before the YouTube addon existed get it once.
+            if !entries.iter().any(|e| e.url == YOUTUBE_ADDON_URL) {
+                entries.push(AddonEntry { url: YOUTUBE_ADDON_URL.to_string(), enabled: true });
+                save_addons(&entries)?;
+            }
+            Ok(entries)
+        }
         Err(_) => {
             let entries: Vec<_> = DEFAULT_ADDONS.iter().map(|u| AddonEntry { url: u.to_string(), enabled: true }).collect();
             save_addons(&entries)?;
