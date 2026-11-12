@@ -368,7 +368,11 @@ pub fn is_youtube_url(target: &str) -> bool {
 /// mpv options for YouTube playback. Ads are never part of the stream yt-dlp resolves.
 pub fn mpv_args() -> Vec<String> {
     let height = max_height();
-    let mut args = vec![format!("--ytdl-format=bv*[height<={height}]+ba/b[height<={height}]/b")];
+    // YouTube now refuses many of its direct stream addresses with 403 when mpv fetches them,
+    // while its HLS streams still play and seek. Prefer HLS; keep the old choice as a fallback.
+    let mut args = vec![format!(
+        "--ytdl-format=bv*[protocol^=m3u8][height<={height}]+ba[protocol^=m3u8]/b[protocol^=m3u8][height<={height}]/bv*[height<={height}]+ba/b[height<={height}]/b"
+    )];
     if let Some(tool) = ytdlp() {
         args.push(format!("--script-opts-append=ytdl_hook-ytdl_path={}", tool.display()));
     }
@@ -453,6 +457,19 @@ mod tests {
         assert_eq!(items[0].runtime, "11 min");
         assert_eq!(items[0].release_info, "2015");
         assert_eq!(next.as_deref(), Some("NEXT"));
+    }
+
+    #[test]
+    fn playback_prefers_hls_and_falls_back() {
+        let format = mpv_args().into_iter().next().unwrap();
+        let choices: Vec<&str> = format.trim_start_matches("--ytdl-format=").split('/').collect();
+        assert!(choices[0].contains("protocol^=m3u8"), "HLS must be tried first: {format}");
+        assert!(choices[0].split('+').all(|part| part.contains("protocol^=m3u8")), "both HLS video and audio, or YouTube refuses the audio: {format}");
+        let last_hls = choices.iter().rposition(|c| c.contains("m3u8")).unwrap();
+        let first_other = choices.iter().position(|c| !c.contains("m3u8")).unwrap();
+        assert!(last_hls < first_other, "every HLS choice comes before every other one: {format}");
+        assert!(choices.iter().any(|c| !c.contains("m3u8")), "a non-HLS fallback must remain: {format}");
+        assert!(choices.iter().all(|c| c.contains("height<=") || *c == "b"), "every choice keeps the height limit: {format}");
     }
 
     #[test]
